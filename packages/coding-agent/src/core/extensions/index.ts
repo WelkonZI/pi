@@ -10,6 +10,7 @@ export {
 	loadExtensionFromFactory,
 	loadExtensions,
 } from "./loader.ts";
+export type { MutationInterceptEvent, MutationInterceptor, MutationStage } from "./mutation-interceptor.ts";
 export type {
 	ExtensionErrorListener,
 	ForkHandler,

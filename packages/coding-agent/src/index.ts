@@ -51,6 +51,7 @@ export {
 } from "./core/compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
+export type { MutationInterceptEvent, MutationInterceptor, MutationStage } from "./core/extensions/index.ts";
 export type {
 	AfterProviderResponseEvent,
 	AgentActivityOutcome,
