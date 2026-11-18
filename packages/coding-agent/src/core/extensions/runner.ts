@@ -25,6 +25,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
+import { beginMutation, contextMutation } from "./mutation-interceptor-hooks.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartCustomEvent,
@@ -1315,6 +1316,7 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context")) {
 			for (const handler of handlers) {
+				const mutation = contextMutation(this.runtime, ext, currentMessages, restoreSystemMessages);
 				try {
 					const visibleMessages = currentMessages.filter((message) => message.role !== "system");
 					const visibleSnapshot = visibleMessages.slice();
@@ -1324,9 +1326,10 @@ export class ExtensionRunner {
 					// Handlers may return a new list or edit event.messages in place.
 					const returned =
 						handlerResult?.messages ??
-						(sameMessages(visibleMessages, visibleSnapshot) ? undefined : visibleMessages);
+						(sameMessages(visibleMessages, visibleSnapshot) ? mutation && visibleMessages : visibleMessages);
 					if (!returned) continue;
 					currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
+					mutation?.capture(visibleSnapshot, returned);
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
@@ -1337,11 +1340,13 @@ export class ExtensionRunner {
 						stack,
 					});
 				}
+				if (mutation) currentMessages = mutation.finish(currentMessages);
 			}
 		}
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context_with_system")) {
 			for (const handler of handlers) {
+				const mutation = beginMutation(this.runtime, "context_with_system", ext, currentMessages);
 				try {
 					const hadLeadingSystemMessage = currentMessages[0]?.role === "system";
 					const event: ContextWithSystemEvent = { type: "context_with_system", messages: currentMessages };
@@ -1349,13 +1354,14 @@ export class ExtensionRunner {
 					currentMessages = handlerResult?.messages ?? currentMessages;
 					// Providers read the prompt and initial tools from the leading system message.
 					// Losing it is never intended; report it but honor the handler's output.
-					if (hadLeadingSystemMessage && currentMessages[0]?.role !== "system") {
+					if (!mutation && hadLeadingSystemMessage && currentMessages[0]?.role !== "system") {
 						this.emitError({
 							extensionPath: ext.path,
 							event: "context_with_system",
 							error: "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage().",
 						});
 					}
+					mutation?.succeed();
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
@@ -1366,6 +1372,7 @@ export class ExtensionRunner {
 						stack,
 					});
 				}
+				if (mutation) currentMessages = mutation.finish(currentMessages, (error) => this.emitError(error));
 			}
 		}
 
@@ -1378,6 +1385,7 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_provider_request")) {
 			for (const handler of handlers) {
+				const mutation = beginMutation(this.runtime, "before_provider_request", ext, currentPayload);
 				try {
 					const event: BeforeProviderRequestEvent = {
 						type: "before_provider_request",
@@ -1387,6 +1395,7 @@ export class ExtensionRunner {
 					if (handlerResult !== undefined) {
 						currentPayload = handlerResult;
 					}
+					mutation?.succeed();
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
@@ -1397,6 +1406,7 @@ export class ExtensionRunner {
 						stack,
 					});
 				}
+				if (mutation) currentPayload = mutation.finish(currentPayload);
 			}
 		}
 
@@ -1435,7 +1445,7 @@ export class ExtensionRunner {
 		trigger: BeforeAgentStartTrigger,
 		systemPromptOptions: BuildSystemPromptOptions,
 	): Promise<BeforeAgentStartCombinedResult> {
-		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
+		let currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
 		const ctx = Object.defineProperties(
 			{},
@@ -1449,6 +1459,7 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
 			for (const handler of handlers) {
+				const mutation = beginMutation(this.runtime, "before_agent_start", ext, currentOptions);
 				try {
 					const event: BeforeAgentStartEvent = {
 						...trigger,
@@ -1467,6 +1478,7 @@ export class ExtensionRunner {
 							currentOptions.forceSystemPrompt = result.systemPrompt;
 						}
 					}
+					mutation?.succeed();
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
@@ -1477,6 +1489,7 @@ export class ExtensionRunner {
 						stack,
 					});
 				}
+				if (mutation) currentOptions = mutation.finish(currentOptions);
 			}
 		}
 

@@ -17,6 +17,7 @@ import {
 	loadExtensionFromFactory,
 	loadExtensionsCached,
 } from "./extensions/loader.ts";
+import { hasFactorySource } from "./extensions/mutation-interceptor-loader.ts";
 import type {
 	Extension,
 	ExtensionFactory,
@@ -615,7 +616,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		);
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
-		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
+		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions, metadataByPath);
 		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 		for (const p of this.additionalExtensionPaths) {
 			if (isLocalPath(p)) {
@@ -722,7 +723,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions)
 		).filter((path) => !path.startsWith(BUILTIN_PATH_PREFIX));
 		const metadataByPath = new Map(
-			[...resolvedPaths.extensions, ...cliExtensionPaths.extensions].map((resource) => [
+			[...cliExtensionPaths.extensions, ...resolvedPaths.extensions].map((resource) => [
 				resource.path,
 				resource.metadata,
 			]),
@@ -732,7 +733,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			resolvedPaths.installFailures,
 			cliExtensionPaths.installFailures,
 		);
-		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
+		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus, undefined, metadataByPath);
 		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;
@@ -756,13 +757,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	/** Load extension paths: files from disk and `builtin:<name>` paths from the built-in extensions. */
-	private async loadExtensionPaths(paths: string[], runtime?: ExtensionRuntime): Promise<LoadExtensionsResult> {
+	private async loadExtensionPaths(paths: string[], runtime?: ExtensionRuntime, metadataByPath?: Map<string, PathMetadata>): Promise<LoadExtensionsResult> {
 		const isBuiltinPath = (path: string) => path.startsWith(BUILTIN_PATH_PREFIX);
 		const result = await loadExtensionsCached(
 			paths.filter((path) => !isBuiltinPath(path)),
 			this.cwd,
 			this.eventBus,
 			runtime,
+			metadataByPath,
 		);
 		for (const path of paths.filter(isBuiltinPath)) {
 			const builtin = this.builtinExtensions.get(path.slice(BUILTIN_PATH_PREFIX.length));
@@ -791,6 +793,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private async loadFinalExtensionSet(
 		extensionPaths: string[],
 		preTrustExtensions: LoadExtensionsResult | undefined,
+		metadataByPath: Map<string, PathMetadata>,
 	): Promise<LoadExtensionsResult> {
 		// Without a pre-trust pass nothing is preloaded, and inline extensions load here.
 		const preloaded = preTrustExtensions?.extensions ?? [];
@@ -806,7 +809,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			const pathKey = this.getExtensionPathKey(path);
 			return !preloadedByPath.has(pathKey) && !failedPreloadPaths.has(pathKey);
 		});
-		const remainingExtensions = await this.loadExtensionPaths(remainingPaths, preTrustExtensions?.runtime);
+		const remainingExtensions = await this.loadExtensionPaths(remainingPaths, preTrustExtensions?.runtime, metadataByPath);
 		const loadedByPath = new Map(preloadedByPath);
 		for (const extension of remainingExtensions.extensions) {
 			loadedByPath.set(getResourcePathKey(extension.resolvedPath), extension);
@@ -957,6 +960,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private applyExtensionSourceInfo(extensions: Extension[], metadataByPath: Map<string, PathMetadata>): void {
 		for (const extension of extensions) {
+			if (hasFactorySource(extension)) continue;
 			extension.sourceInfo =
 				this.findSourceInfoForPath(extension.path, undefined, metadataByPath) ??
 				this.getDefaultSourceInfoForPath(extension.path);

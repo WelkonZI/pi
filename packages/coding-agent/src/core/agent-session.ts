@@ -114,6 +114,7 @@ import {
 	type TurnStartEvent,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
+import { interceptSections } from "./extensions/mutation-interceptor-hooks.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
@@ -1834,7 +1835,7 @@ export class AgentSession {
 		options.hiddenTools = [...this._hiddenDeclarations];
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
-			buildSystemPromptSections(options),
+			interceptSections(this._resourceLoader, messages, buildSystemPromptSections(options)),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
 	}

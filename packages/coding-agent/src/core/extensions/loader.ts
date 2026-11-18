@@ -21,6 +21,7 @@ import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
+import { type FactorySources, mutationLoad } from "./mutation-interceptor-loader.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -629,9 +630,10 @@ async function initializeExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
+	sources?: FactorySources,
 ): Promise<Extension> {
 	const extension = createExtension(extensionPath, resolvedPath);
-	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
+	const load = mutationLoad(extension, runtime, sources, () => createExtensionAPI(extension, runtime, cwd, eventBus));
 	try {
 		await factory(load.api);
 		load.commit();
@@ -649,6 +651,7 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
+	sources?: FactorySources,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
@@ -659,7 +662,7 @@ async function loadExtension(
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
-		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime);
+		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime, sources);
 
 		return { extension, error: null };
 	} catch (err) {
@@ -691,6 +694,7 @@ async function loadExtensionsInternal(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	useCache = false,
+	metadataByPath?: FactorySources,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
@@ -707,6 +711,7 @@ async function loadExtensionsInternal(
 			resolvedEventBus,
 			resolvedRuntime,
 			cacheToken,
+			metadataByPath,
 		);
 
 		if (error) {
@@ -732,8 +737,9 @@ export async function loadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	metadataByPath?: FactorySources,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, false, metadataByPath);
 }
 
 export async function loadExtensionsCached(
@@ -741,8 +747,9 @@ export async function loadExtensionsCached(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	metadataByPath?: FactorySources,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true, metadataByPath);
 }
 
 function isExtensionFile(name: string): boolean {

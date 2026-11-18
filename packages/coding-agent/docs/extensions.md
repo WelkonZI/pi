@@ -3250,6 +3250,7 @@ const highlighted = highlightCode(code, lang);
 ## Error Handling
 
 - Extension errors are logged, agent continues
+- Exception: [`pi.registerMutationInterceptor`](mutation-interceptor.md) errors fail the current operation closed
 - `tool_call` errors block the tool (fail-safe)
 - `user_bash` errors block the command instead of falling through to local execution
 - Tool `execute` errors are signaled by throwing or by returning `isError: true`; a thrown error is caught, reported to the LLM as an error result, and execution continues
