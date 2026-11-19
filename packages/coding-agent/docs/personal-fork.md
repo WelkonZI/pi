@@ -4,7 +4,11 @@ This fork publishes `@earendil-works/pi-coding-agent` as a GitHub Release tarbal
 
 ## Create a release
 
-Run the **Personal Release** workflow manually from the `personal` default branch. The workflow:
+The [**Personal Release** workflow](../../../.github/workflows/personal-release.yml) checks for official stable releases every 48 hours at 06:17 UTC, on even-numbered UTC days counted from the Unix epoch. A daily trigger exits before checkout on the intervening days, avoiding the month-boundary resets of a day-of-month `*/2` cron. Manual runs from the `personal` default branch bypass this interval.
+
+GitHub Actions can delay or drop scheduled runs. Public repositories' schedules are disabled after 60 days without repository activity. This schedule publishes fork releases; it does not update a locally installed Pi.
+
+The workflow:
 
 1. finds the latest stable `earendil-works/pi` release;
 2. derives the personal patch boundary from Git history, rebases onto that tag, and stops on conflicts;
@@ -19,6 +23,12 @@ Run the **Personal Release** workflow manually from the `personal` default branc
 The temporary version stamp exists only in the tarball. The release tag points to the verified source commit, whose `packages/coding-agent/package.json` keeps the upstream version.
 
 If transfer, checks, build, packaging, smoke installation, or the lease-protected branch update fails, no release is published. A conflict must be resolved manually. A retry after a successful branch update reuses the transferred candidate without replaying upstream commits. It may reuse a retained same-source orphan tag only after confirming that no draft or published release uses it. Failed publication cleanup removes only the exact draft release ID owned by that workflow run; remote tags, foreign releases, and uncertain state are preserved, so the previous normal release remains the `latest` release.
+
+## Notifications
+
+Use GitHub **Settings → Notifications → System → Actions** to enable email and/or on-site workflow notifications. **Only notify for failed workflows** limits these to failures such as a rebase conflict or failed check. Scheduled-run notifications go to the user who last changed the cron syntax, subject to those notification settings.
+
+Subscribe separately to **Watch → Custom → Releases** on `WelkonZI/pi` for published-release notifications. No external notification service is configured. See [GitHub Actions notification settings](https://docs.github.com/en/subscriptions-and-notifications/how-tos/managing-github-actions-notifications).
 
 ## Install and update
 

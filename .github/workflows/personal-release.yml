@@ -2,6 +2,8 @@ name: Personal Release
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
 
 permissions: {}
 
@@ -15,7 +17,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check 48-hour schedule
+        id: schedule
+        run: |
+          set -euo pipefail
+          should_run=true
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            now="$(date -u +%s)"
+            # UTC epoch-day parity keeps 48-hour intervals across month boundaries.
+            if (( now / 86400 % 2 != 0 )); then should_run=false; fi
+          fi
+          echo "should_run=${should_run}" >> "${GITHUB_OUTPUT}"
+
       - name: Checkout personal branch
+        if: steps.schedule.outputs.should_run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: personal
@@ -23,11 +38,13 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node.js
+        if: steps.schedule.outputs.should_run == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
 
       - name: Prepare release candidate
+        if: steps.schedule.outputs.should_run == 'true'
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
@@ -123,6 +140,7 @@ jobs:
             .github/scripts/cleanup-personal-release.test.mjs \
             .github/scripts/next-personal-release-revision.test.mjs \
             .github/scripts/personal-release-tag.test.mjs \
+            .github/scripts/personal-release-schedule.test.mjs \
             .github/scripts/publish-personal-release.test.mjs \
             .github/scripts/rebase-personal-release.test.mjs
           npx vitest run \
