@@ -478,6 +478,15 @@ describe("detectInstallMethod", () => {
 			"the install path is not writable",
 		);
 	});
+
+	test("directs unsupported Bun binaries to the fork tarball", () => {
+		const packageName = "@earendil-works/pi-coding-agent";
+		const installSpec =
+			"https://github.com/WelkonZI/pi/releases/download/v1.5.3-welkonzi.1/pi-coding-agent-1.5.3-welkonzi.1.tgz";
+		expect(
+			getSelfUpdateUnavailableInstruction(packageName, undefined, { packageName, installSpec }, "bun-binary"),
+		).toBe(`Download from: ${installSpec}`);
+	});
 });
 
 describe("detectInstallChange", () => {
@@ -522,23 +531,16 @@ describe("configured self-update command", () => {
 	});
 
 	test("fills placeholders in every argument", () => {
+		const installSpec = "https://github.com/WelkonZI/pi/releases/download/v1.2.3/pi-coding-agent-1.2.3.tgz";
 		const command = makeConfiguredSelfUpdateCommand(
 			["wrapper", "install", "{installSpec}", "--name={packageName}", "--version", "{version}", "{unknown}"],
-			{ packageName: "@earendil-works/pi-coding-agent", version: "1.2.3" },
+			{ installSpec, packageName: "@earendil-works/pi-coding-agent", version: "1.2.3" },
 		);
 
 		expect(command).toEqual({
 			command: "wrapper",
-			args: [
-				"install",
-				"@earendil-works/pi-coding-agent@1.2.3",
-				"--name=@earendil-works/pi-coding-agent",
-				"--version",
-				"1.2.3",
-				"{unknown}",
-			],
-			display:
-				"wrapper install @earendil-works/pi-coding-agent@1.2.3 --name=@earendil-works/pi-coding-agent --version 1.2.3 {unknown}",
+			args: ["install", installSpec, "--name=@earendil-works/pi-coding-agent", "--version", "1.2.3", "{unknown}"],
+			display: `wrapper install ${installSpec} --name=@earendil-works/pi-coding-agent --version 1.2.3 {unknown}`,
 		});
 	});
 });
