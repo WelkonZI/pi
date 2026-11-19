@@ -1,15 +1,7 @@
 import { compare, valid } from "semver";
-import { fetchWithRetry } from "./management-http.ts";
-import { getPiUserAgent } from "./pi-user-agent.ts";
+import { getPersonalForkRelease, type PersonalForkRelease } from "./personal-fork-release.ts";
 
-const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
-const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
-
-export interface LatestPiRelease {
-	version: string;
-	packageName?: string;
-	note?: string;
-}
+export type LatestPiRelease = PersonalForkRelease;
 
 /** Include useful errno details hidden behind Node's generic "fetch failed" error. */
 export function formatVersionCheckError(error: unknown): string {
@@ -53,38 +45,7 @@ export async function getLatestPiRelease(
 	options: { timeoutMs?: number; retry?: boolean } = {},
 ): Promise<LatestPiRelease | undefined> {
 	if (process.env.PI_OFFLINE) return undefined;
-
-	const response = await fetchWithRetry(
-		LATEST_VERSION_URL,
-		{
-			headers: {
-				"User-Agent": getPiUserAgent(currentVersion),
-				accept: "application/json",
-			},
-		},
-		{
-			maxRetries: options.retry ? 2 : 0,
-			timeoutMs: options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS,
-		},
-	);
-	if (!response.ok) return undefined;
-
-	const data = (await response.json()) as {
-		packageName?: unknown;
-		version?: unknown;
-		note?: unknown;
-	};
-	if (typeof data.version !== "string" || !data.version.trim()) {
-		return undefined;
-	}
-	const packageName =
-		typeof data.packageName === "string" && data.packageName.trim() ? data.packageName.trim() : undefined;
-	const note = typeof data.note === "string" && data.note.trim() ? data.note.trim() : undefined;
-	return {
-		version: data.version.trim(),
-		packageName,
-		...(note ? { note } : {}),
-	};
+	return getPersonalForkRelease(currentVersion, options);
 }
 
 export async function getLatestPiVersion(

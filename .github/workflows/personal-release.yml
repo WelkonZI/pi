@@ -1,0 +1,241 @@
+name: Personal Release
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: personal-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout personal branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: personal
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Prepare release candidate
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin personal main --tags
+          expected_personal_sha="$(git rev-parse refs/remotes/origin/personal)"
+
+          upstream_tag="$(gh api repos/earendil-works/pi/releases/latest --jq .tag_name)"
+          if [[ ! "${upstream_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream release tag: ${upstream_tag}"
+            exit 1
+          fi
+          git fetch --no-tags https://github.com/earendil-works/pi.git \
+            "refs/tags/${upstream_tag}:refs/tags/upstream-${upstream_tag}" \
+            "refs/heads/main:refs/remotes/upstream/main"
+          upstream_ref="refs/tags/upstream-${upstream_tag}"
+
+          manifest_url="https://github.com/WelkonZI/pi/releases/latest/download/latest.json"
+          manifest_status="$(curl --location --silent --show-error --output previous-latest.json --write-out '%{http_code}' "${manifest_url}")"
+          if [[ "${manifest_status}" == "200" ]]; then
+            previous_upstream_tag="$(jq -er '.upstreamTag | strings | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' previous-latest.json)"
+            previous_source_commit="$(jq -er '.sourceCommit | strings | select(test("^[0-9a-f]{40}$"))' previous-latest.json)"
+          elif [[ "${manifest_status}" == "404" ]]; then
+            previous_upstream_tag=""
+            previous_source_commit=""
+          else
+            echo "::error::Could not download current fork manifest (HTTP ${manifest_status})."
+            exit 1
+          fi
+
+          bash .github/scripts/rebase-personal-release.sh \
+            refs/remotes/origin/personal \
+            refs/remotes/upstream/main \
+            "${upstream_ref}" \
+            "${upstream_tag}"
+
+          source_commit="$(git rev-parse HEAD)"
+          if [[ "${previous_upstream_tag}" == "${upstream_tag}" && "${previous_source_commit}" == "${source_commit}" ]]; then
+            echo "Fork release is already current at ${source_commit}."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          upstream_version="${upstream_tag#v}"
+          revision="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' | \
+            node .github/scripts/next-personal-release-revision.mjs "${upstream_version}")"
+          fork_version="${upstream_version}-welkonzi.${revision}"
+          if ! bash .github/scripts/check-personal-release-tag.sh \
+            "${GITHUB_REPOSITORY}" \
+            "v${fork_version}" \
+            "${source_commit}" \
+            origin >/dev/null; then
+            echo "::error::Release revision collision for v${fork_version}."
+            exit 1
+          fi
+
+          echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          echo "expected_personal_sha=${expected_personal_sha}" >> "${GITHUB_OUTPUT}"
+          echo "fork_version=${fork_version}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=v${fork_version}" >> "${GITHUB_OUTPUT}"
+          echo "source_commit=${source_commit}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_tag=${upstream_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check and build candidate
+        if: steps.prepare.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+
+          unexpected_packages="$(git diff --name-only "refs/tags/upstream-${{ steps.prepare.outputs.upstream_tag }}"...HEAD -- 'packages/*' ':!packages/coding-agent/**')"
+          if [[ -n "${unexpected_packages}" ]]; then
+            echo "::error::Personal runtime changes extend beyond packages/coding-agent:"
+            printf '%s\n' "${unexpected_packages}"
+            exit 1
+          fi
+
+          npm ci --ignore-scripts
+          npm run hydrate:model-data
+          npm run check:pinned-deps
+          npm run check:runtime-deps
+          npm run check:ts-imports
+          npm run check:entry-graphs
+          npm run check:install-lock:coding-agent
+          npx tsc --noEmit
+          npx tsc --noEmit -p packages/coding-agent/examples/tsconfig.json
+          npm run check:browser-smoke
+          npm run build:offline
+          node --test \
+            .github/scripts/cleanup-personal-release.test.mjs \
+            .github/scripts/next-personal-release-revision.test.mjs \
+            .github/scripts/personal-release-tag.test.mjs \
+            .github/scripts/publish-personal-release.test.mjs \
+            .github/scripts/rebase-personal-release.test.mjs
+          npx vitest run \
+            --config packages/coding-agent/vitest.config.ts \
+            packages/coding-agent/test/personal-fork-release.test.ts \
+            packages/coding-agent/test/version-check.test.ts \
+            packages/coding-agent/test/package-command-paths.test.ts
+
+      - name: Pack and smoke-test release
+        if: steps.prepare.outputs.should_release == 'true'
+        env:
+          FORK_VERSION: ${{ steps.prepare.outputs.fork_version }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.prepare.outputs.source_commit }}
+          UPSTREAM_TAG: ${{ steps.prepare.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          package_json="packages/coding-agent/package.json"
+          restore_package_json() {
+            git checkout -- "${package_json}"
+          }
+          trap restore_package_json EXIT
+
+          node - "${FORK_VERSION}" <<'NODE'
+          const fs = require("node:fs");
+          const path = "packages/coding-agent/package.json";
+          const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+          manifest.version = process.argv[2];
+          fs.writeFileSync(path, `${JSON.stringify(manifest, null, "\t")}\n`);
+          NODE
+
+          npm --prefix packages/coding-agent run build
+
+          mkdir -p release-assets
+          pack_json="$(cd packages/coding-agent && npm pack --ignore-scripts --json --pack-destination "${GITHUB_WORKSPACE}/release-assets")"
+          packed_file="$(jq -er '.[0].filename' <<<"${pack_json}")"
+          asset_name="pi-coding-agent-${FORK_VERSION}.tgz"
+          mv "release-assets/${packed_file}" "release-assets/${asset_name}"
+
+          tar -xOf "release-assets/${asset_name}" package/package.json | \
+            jq -e --arg version "${FORK_VERSION}" '.version == $version' >/dev/null
+
+          restore_package_json
+          trap - EXIT
+          git diff --exit-code
+
+          smoke_prefix="$(mktemp -d)"
+          npm install --global --ignore-scripts --prefix "${smoke_prefix}" "${GITHUB_WORKSPACE}/release-assets/${asset_name}"
+          installed_version="$("${smoke_prefix}/bin/pi" --version)"
+          if [[ "${installed_version}" != "${FORK_VERSION}" ]]; then
+            echo "::error::Smoke install reports ${installed_version}, expected ${FORK_VERSION}."
+            exit 1
+          fi
+
+          install_spec="https://github.com/WelkonZI/pi/releases/download/${RELEASE_TAG}/${asset_name}"
+          jq -n \
+            --arg version "${FORK_VERSION}" \
+            --arg installSpec "${install_spec}" \
+            --arg upstreamTag "${UPSTREAM_TAG}" \
+            --arg sourceCommit "${SOURCE_COMMIT}" \
+            '{version: $version, installSpec: $installSpec, upstreamTag: $upstreamTag, sourceCommit: $sourceCommit}' \
+            > release-assets/latest.json
+
+      - name: Publish release
+        if: steps.prepare.outputs.should_release == 'true'
+        env:
+          EXPECTED_PERSONAL_SHA: ${{ steps.prepare.outputs.expected_personal_sha }}
+          FORK_VERSION: ${{ steps.prepare.outputs.fork_version }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MARKER: personal-release:${{ github.run_id }}:${{ github.run_attempt }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.prepare.outputs.source_commit }}
+          UPSTREAM_TAG: ${{ steps.prepare.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          remote_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push \
+            "${remote_url}" \
+            HEAD:refs/heads/personal \
+            "--force-with-lease=refs/heads/personal:${EXPECTED_PERSONAL_SHA}"
+
+          if ! remote_tag_sha="$(
+            bash .github/scripts/check-personal-release-tag.sh \
+              "${GITHUB_REPOSITORY}" \
+              "${RELEASE_TAG}" \
+              "${SOURCE_COMMIT}" \
+              "${remote_url}"
+          )"; then
+            echo "::error::Release tag ${RELEASE_TAG} is not available."
+            exit 1
+          fi
+          if [[ -z "${remote_tag_sha}" ]]; then
+            git tag --force "${RELEASE_TAG}" "${SOURCE_COMMIT}"
+            if ! git push "${remote_url}" "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" &&
+              { ! remote_tag_sha="$(
+                  bash .github/scripts/check-personal-release-tag.sh \
+                    "${GITHUB_REPOSITORY}" \
+                    "${RELEASE_TAG}" \
+                    "${SOURCE_COMMIT}" \
+                    "${remote_url}"
+                )" || [[ "${remote_tag_sha}" != "${SOURCE_COMMIT}" ]]; }; then
+              echo "::error::Could not reserve tag ${RELEASE_TAG}."
+              exit 1
+            fi
+          fi
+
+          bash .github/scripts/publish-personal-release.sh \
+            "${GITHUB_REPOSITORY}" \
+            "${RELEASE_TAG}" \
+            "${SOURCE_COMMIT}" \
+            "${FORK_VERSION}" \
+            "${UPSTREAM_TAG}" \
+            "${RELEASE_MARKER}" \
+            release-assets

@@ -1,0 +1,37 @@
+# WelkonZI fork releases
+
+This fork publishes `@earendil-works/pi-coding-agent` as a GitHub Release tarball. It does not publish fork packages to npm.
+
+## Create a release
+
+Run the **Personal Release** workflow manually from the `personal` default branch. The workflow:
+
+1. finds the latest stable `earendil-works/pi` release;
+2. derives the personal patch boundary from Git history, rebases onto that tag, and stops on conflicts;
+3. rejects personal package changes outside `packages/coding-agent`;
+4. runs checks, focused updater tests, and the production build;
+5. assigns `<upstream-version>-welkonzi.<revision>`;
+6. temporarily stamps and packs only the coding-agent tarball;
+7. installs the tarball in an isolated prefix and verifies `pi --version`;
+8. updates `personal` with lease protection;
+9. publishes a normal GitHub Release containing the tarball and `latest.json`.
+
+The temporary version stamp exists only in the tarball. The release tag points to the verified source commit, whose `packages/coding-agent/package.json` keeps the upstream version.
+
+If transfer, checks, build, packaging, smoke installation, or the lease-protected branch update fails, no release is published. A conflict must be resolved manually. A retry after a successful branch update reuses the transferred candidate without replaying upstream commits. It may reuse a retained same-source orphan tag only after confirming that no draft or published release uses it. Failed publication cleanup removes only the exact draft release ID owned by that workflow run; remote tags, foreign releases, and uncertain state are preserved, so the previous normal release remains the `latest` release.
+
+## Install and update
+
+Install the first fork release once from its GitHub Release tarball:
+
+```sh
+npm install -g --ignore-scripts "https://github.com/WelkonZI/pi/releases/download/<tag>/pi-coding-agent-<version>.tgz"
+```
+
+After the tracked agent settings are deployed, update normally:
+
+```sh
+pi update
+```
+
+Use `pi update --force` to reinstall the current fork release. The updater accepts only the canonical `WelkonZI/pi` HTTPS tarball URL from `latest.json`; it never falls back to the official npm package or managed installer. A malformed or unavailable manifest stops before installation. Every install path verifies the PATH-resolved `pi --version` and fails on a mismatch. A managed installation without `selfUpdateCommand` fails closed. The global package replacement does not modify `~/.pi/agent`, so settings, extensions, sessions, and credentials remain in place.

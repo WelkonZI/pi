@@ -347,12 +347,12 @@ export function getConfiguredSelfUpdateArgv(setting: string[] | undefined): stri
 /** Fill the `{packageName}`, `{version}`, and `{installSpec}` placeholders of a configured self-update command. */
 export function makeConfiguredSelfUpdateCommand(
 	argv: string[],
-	release: { packageName: string; version: string },
+	release: { installSpec: string; packageName: string; version: string },
 ): SelfUpdateCommand {
 	const values: Record<string, string> = {
 		packageName: release.packageName,
 		version: release.version,
-		installSpec: `${release.packageName}@${release.version}`,
+		installSpec: release.installSpec,
 	};
 	const [command = "", ...args] = argv.map((arg) =>
 		arg.replace(/\{(packageName|version|installSpec)\}/g, (_, name: string) => values[name]),
@@ -364,11 +364,15 @@ export function getSelfUpdateUnavailableInstruction(
 	packageName: string,
 	npmCommand?: string[],
 	updatePackageTarget: SelfUpdatePackageTarget = packageName,
+	method: InstallMethod = detectInstallMethod(),
 ): string {
-	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi/releases/latest`;
+		const downloadTarget =
+			target.installSpec === target.packageName
+				? "https://github.com/earendil-works/pi/releases/latest"
+				: target.installSpec;
+		return `Download from: ${downloadTarget}`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
 	// Path-based detection also matches installs that only live under a package manager's directory,
