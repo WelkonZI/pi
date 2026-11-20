@@ -1,49 +1,110 @@
 import type { PathMetadata } from "../package-manager.ts";
 import { createSourceInfo } from "../source-info.ts";
-import { assertMutationInterceptorRegistration, type MutationInterceptor, type MutationInterceptorRegistration } from "./mutation-interceptor.ts";
-import type { Extension, ExtensionAPI, ExtensionRuntime } from "./types.ts";
+import {
+	beginMutation,
+	getDeclaredMutationInterceptor,
+	type MutationInterceptorRegistration,
+	type MutationOperation,
+	type MutationToolDefinition,
+	observeMutation,
+} from "./mutation-interceptor.ts";
+import { applyToolDefinition, projectToolDefinition } from "./mutation-interceptor-hooks.ts";
+import type { Extension, ExtensionAPI, ExtensionFactory, ExtensionRuntime, ToolDefinition } from "./types.ts";
 
 export type FactorySources = ReadonlyMap<string, PathMetadata>;
-type ExtensionLoad = { api: ExtensionAPI; commit: () => void; discard: () => void };
+type ExtensionLoad = { api: ExtensionAPI; commit: () => void; discard: (error?: unknown) => void };
 const factorySources = new WeakSet<Extension>();
 
-// Keep factory metadata identity through the legacy post-load attribution pass.
 export function hasFactorySource(extension: Extension): boolean {
 	return factorySources.has(extension);
 }
 
-export function mutationLoad(extension: Extension, runtime: ExtensionRuntime, sources: FactorySources | undefined, create: () => ExtensionLoad): ExtensionLoad {
+export function bootstrapMutationInterceptor(
+	extensionPath: string,
+	resolvedPath: string,
+	factory: ExtensionFactory,
+	runtime: ExtensionRuntime,
+	sources: FactorySources | undefined,
+): void {
+	const interceptor = getDeclaredMutationInterceptor(factory);
+	if (!interceptor) throw new Error(`Trusted mutation hook is not declared by ${extensionPath}`);
+	const metadata = sources?.get(extensionPath) ?? sources?.get(resolvedPath);
+	if (!metadata) throw new Error(`Trusted mutation hook has no configured source metadata: ${extensionPath}`);
+	const sourceInfo = createSourceInfo(extensionPath, metadata);
+	if (sourceInfo.scope !== "user") {
+		throw new Error(`Trusted mutation hook requires user scope: ${extensionPath} (${sourceInfo.scope})`);
+	}
+	if (runtime.mutationInterceptor) {
+		if (runtime.mutationInterceptor.sourceInfo.path === sourceInfo.path) return;
+		throw new Error(`Trusted mutation hook already configured by ${runtime.mutationInterceptor.sourceInfo.path}`);
+	}
+	const registration: MutationInterceptorRegistration = { sourceInfo, interceptor };
+	runtime.mutationInterceptor = registration;
+	observeMutation(runtime, "trusted_hook", "initialized", null, { sourceInfo });
+}
+
+interface PendingToolMutation {
+	mutation: MutationOperation<MutationToolDefinition>;
+	value: MutationToolDefinition;
+}
+
+export function mutationLoad(
+	extension: Extension,
+	runtime: ExtensionRuntime,
+	sources: FactorySources | undefined,
+	moduleReused: boolean,
+	create: () => ExtensionLoad,
+): ExtensionLoad {
 	const metadata = sources?.get(extension.path) ?? sources?.get(extension.resolvedPath);
 	if (metadata) extension.sourceInfo = createSourceInfo(extension.path, metadata);
 	factorySources.add(extension);
+	observeMutation(runtime, "extension_factory", "started", { moduleReused }, { sourceInfo: extension.sourceInfo });
 	const load = create();
+	const registerTool = load.api.registerTool.bind(load.api);
 	let state: "loading" | "active" | "failed" = "loading";
-	let pending: MutationInterceptorRegistration | undefined;
+	const pendingTools: PendingToolMutation[] = [];
 	Object.assign(load.api, {
-		registerMutationInterceptor(interceptor: MutationInterceptor): void {
-			if (state === "failed") throw new Error(`Extension "${extension.path}" failed to load and its API is no longer active.`);
-			runtime.assertActive();
-			assertMutationInterceptorRegistration(extension.sourceInfo, pending ?? runtime.mutationInterceptor);
-			const registration = { sourceInfo: extension.sourceInfo, interceptor };
-			if (state === "loading") pending = registration;
-			else runtime.mutationInterceptor = registration;
+		registerTool(definition: ToolDefinition): void {
+			if (!runtime.mutationInterceptor) {
+				registerTool(definition);
+				return;
+			}
+			const before = projectToolDefinition(definition, extension.sourceInfo);
+			const mutation = beginMutation(runtime, "tool_registration", before, {
+				sourceInfo: extension.sourceInfo,
+				ownerInfo: extension.sourceInfo,
+				reason: state === "loading" ? "factory" : "runtime",
+			});
+			const accepted = mutation?.candidate(before) ?? before;
+			try {
+				registerTool(applyToolDefinition(definition, accepted));
+			} catch (error) {
+				mutation?.applied(before, "rejected", error);
+				throw error;
+			}
+			if (!mutation) return;
+			mutation.release();
+			if (state === "loading") pendingTools.push({ mutation, value: accepted });
+			else mutation.applied(accepted, "registered");
 		},
 	});
 	return {
 		api: load.api,
 		commit(): void {
 			if (state !== "loading") return;
-			runtime.assertActive();
-			if (pending) assertMutationInterceptorRegistration(pending.sourceInfo, runtime.mutationInterceptor);
 			load.commit();
-			if (pending) runtime.mutationInterceptor = pending;
-			pending = undefined;
 			state = "active";
+			for (const pending of pendingTools) pending.mutation.applied(pending.value, "registered");
+			pendingTools.length = 0;
+			observeMutation(runtime, "extension_factory", "succeeded", null, { sourceInfo: extension.sourceInfo });
 		},
-		discard(): void {
-			pending = undefined;
+		discard(error?: unknown): void {
+			if (state !== "loading") return;
 			state = "failed";
+			for (const pending of pendingTools) pending.mutation.applied(pending.value, "discarded", error);
+			pendingTools.length = 0;
 			load.discard();
+			observeMutation(runtime, "extension_factory", "failed", null, { sourceInfo: extension.sourceInfo }, error);
 		},
 	};
 }

@@ -2184,9 +2184,9 @@ export type GetSettingsHandler = () => Settings;
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
-export type SetActiveToolsHandler = (toolNames: string[]) => void;
+export type SetActiveToolsHandler = (toolNames: string[], sourceInfo?: SourceInfo) => void;
 
-export type RefreshToolsHandler = () => void;
+export type RefreshToolsHandler = (sourceInfo?: SourceInfo) => void;
 
 export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
 

@@ -51,7 +51,6 @@ export {
 } from "./core/compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
-export type { MutationInterceptEvent, MutationInterceptor, MutationStage } from "./core/extensions/index.ts";
 export type {
 	AfterProviderResponseEvent,
 	AgentActivityOutcome,
@@ -220,6 +219,13 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
+// biome-ignore format: minimize fork diff
+export type { MutationActiveToolsContext, MutationCallbackMarker, MutationErrorFact, MutationFact, MutationIdentity, MutationInterceptionCall, MutationInterceptor, MutationLoadoutInput, MutationObservationCall, MutationPhase, MutationPrepareLoadoutValue, MutationSkill, MutationSystemToolContext, MutationToolDefinition } from "./core/extensions/mutation-interceptor.ts";
+export { MUTATION_CALLBACK, withMutationInterceptor } from "./core/extensions/mutation-interceptor.ts";
+// biome-ignore format: minimize fork diff
+export type { MutationDiscoveredResources, MutationNormalizedContext, MutationProviderContext, MutationProviderSystemMessage } from "./core/extensions/mutation-interceptor-hooks.ts";
+// biome-ignore format: minimize fork diff
+export type { MutationLoadedResources, MutationNativeResource, MutationNativeResourceDiagnostic } from "./core/extensions/mutation-interceptor-resources.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";

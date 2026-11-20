@@ -2,6 +2,10 @@
 
 This fork publishes `@earendil-works/pi-coding-agent` as a GitHub Release tarball. It does not publish fork packages to npm.
 
+## Fork boundary
+
+Personal runtime behavior is limited to `packages/coding-agent`; `packages/agent` remains upstream-compatible. The fork exposes a [trusted mutation interceptor](mutation-interceptor.md) for stable system/tool provenance. Pi provides live interception and factual observations only. An external consumer owns snapshots, validation, journaling, diffs, attribution policy, and completeness decisions.
+
 ## Create a release
 
 The [**Personal Release** workflow](../../../.github/workflows/personal-release.yml) checks for official stable releases every 48 hours at 06:17 UTC, on even-numbered UTC days counted from the Unix epoch. A daily trigger exits before checkout on the intervening days, avoiding the month-boundary resets of a day-of-month `*/2` cron. Manual runs from the `personal` default branch bypass this interval.

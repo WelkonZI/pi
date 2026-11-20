@@ -353,6 +353,10 @@
       },
       "description": "Local extension file paths or directories."
     },
+    "trustedMutationHook": {
+      "type": "string",
+      "description": "User-scope extension module that declares the trusted mutation hook. Global only."
+    },
     "deviceId": {
       "type": "string",
       "description": "Stable installation UUID, generated when authentication first needs it. Global only."

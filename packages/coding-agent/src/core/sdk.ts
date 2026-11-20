@@ -373,7 +373,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	const transformProviderPayload = async (payload: unknown) => {
 		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("before_provider_request")) return payload;
+		if (!runner) return payload;
 		return runner.emitBeforeProviderRequest(payload);
 	};
 	const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
@@ -410,6 +410,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
+			const runner = extensionRunnerRef.current;
+			const finalContext = runner ? runner.emitNormalizedFinal(context) : context;
 			const requestOptions = buildRequestOptions(options);
 			// Compaction and summaries use their own routing ids; only session requests
 			// replace the cache entry, so warming restarts from them. Keep warming while
@@ -417,9 +419,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// shallow-copy the messages array or refresh the model object without changing
 			// the provider request, so top-level object identity is not a valid cache key.
 			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+				cacheWarmer.start({ model, context: finalContext, options: requestOptions }, cacheContextIsCurrent(model));
 			}
-			return modelRuntime.streamSimple(model, context, requestOptions);
+			return modelRuntime.streamSimple(model, finalContext, requestOptions);
 		},
 		onPayload: transformProviderPayload,
 		onResponse: handleProviderResponse,

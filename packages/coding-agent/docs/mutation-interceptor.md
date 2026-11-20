@@ -1,27 +1,81 @@
 # Trusted mutation interceptor
 
-[Extension API](extensions.md) · `pi.registerMutationInterceptor(interceptor)`
+[Extension API](extensions.md) · [personal `coding-agent` fork](personal-fork.md) only
 
-Register the single trusted, synchronous interceptor for this extension runtime. Only extensions with authoritative `sourceInfo.scope === "user"` may register it. Project extensions, inline factories, and paths without authoritative user metadata cannot register. Duplicate registration throws and preserves the first committed interceptor. Registration during a factory commits only when that factory succeeds.
+The trusted mutation interceptor is a separately configured, synchronous hook for observing and accepting stable system/tool context changes. It is initialized before ordinary extension factories. Ordinary factories still run in their configured order.
+
+Declare the hook on an extension factory:
 
 ```typescript
-pi.registerMutationInterceptor((event) => {
-  // event.stage narrows the state; event.sourceInfo identifies the contributor.
-  // Return the accepted state, including when nothing should change.
-  return event.after;
-});
+import {
+  withMutationInterceptor,
+  type MutationInterceptor,
+} from "@earendil-works/pi-coding-agent";
+
+const interceptor: MutationInterceptor = {
+  intercept(call) {
+    // Return the candidate Pi should apply.
+    return call.value;
+  },
+  observe(call) {
+    // Record lifecycle/outcome facts outside Pi if needed.
+  },
+};
+
+const extension = (pi) => {
+  // Optional ordinary extension behavior.
+};
+
+export default withMutationInterceptor(extension, interceptor);
 ```
 
-`MutationStage`, `MutationInterceptEvent`, and `MutationInterceptor` are public types. The callback receives `{ stage, sourceInfo, before, after }`. `before` is an isolated `structuredClone` snapshot; `after` includes in-place edits and returned replacements. If state cannot be cloned (for example, a payload contains a function), the operation fails before the handler runs. The error identifies the stage, contributor, and interceptor and preserves the cloning error as its cause. The accepted state feeds the next handler or core operation. The interceptor is called directly, not through extension events.
+Configure that module only in global user settings. An absolute path avoids working-directory-dependent resolution:
 
-| Stage | State | Contributor |
-|-------|-------|-------------|
-| `before_agent_start` | Normalized `systemPromptOptions` | Each successful handler's extension |
-| `context` | Message array without system messages | Each successful handler's extension |
-| `context_with_system` | Full message array | Each successful handler's extension |
-| `before_provider_request` | Opaque provider payload (`unknown`) | Each successful handler's extension |
-| `system_prompt_sections` | Complete structured prompt sections, before diff and persistence | Stable `builtin:system_prompt_sections` source |
+```json
+{
+  "trustedMutationHook": "/absolute/path/to/provenance-extension.ts",
+  "extensions": ["/absolute/path/to/provenance-extension.ts"]
+}
+```
 
-Return the accepted state synchronously: `event.after` accepts the contribution, `event.before` reverts it, and a fresh replacement object or array replaces it. Returning `undefined` fails the operation, including at the provider stage: existing provider callbacks interpret that value as keeping the original payload. Promises, thenables, thrown errors, and invalid known stage shapes also fail closed at runtime instead of logging the error and accepting the contribution. Errors identify the stage, contributor, and interceptor and preserve the original cause. Provider payloads are not parsed or provider-validated.
+`trustedMutationHook` imports the module and initializes its declared hook. Listing the same path in `extensions` is optional and controls whether its ordinary factory also runs. Project-scoped or metadata-free hooks are rejected. Only one hook may be installed in an extension runtime.
 
-Without a registered interceptor, existing mutation behavior is unchanged and no interceptor snapshots are made. Pi supplies no content policy. This trusted hook is not an OS sandbox: extensions still execute arbitrary code with your user's privileges.
+## Direct contract
+
+`intercept(call)` receives correlated `before`, `candidate`, and `applied` calls for an operation. `operationId` correlates the phases; `callId` identifies each direct callback. Returning the `candidate` value controls the stable value propagated to the next handler or core boundary.
+
+`observe(call)` reports lifecycle and outcome facts that do not have a replaceable candidate. Both methods are called directly, not through extension events. They must return synchronously. Throws and promises fail the current operation closed and preserve the original error as the cause.
+
+Pi does not clone, validate, diff, journal, replay, or assign policy to these values. A consumer that records provenance owns snapshots, validation, attribution policy, comparisons, and completeness decisions.
+
+Identity fields are factual. Known source, owner, reason, session, operation, call, parent, and cause identifiers are included. Pi assigns turn and provider-attempt identifiers at the coding-agent boundaries it owns; unavailable run identifiers remain `null`.
+
+## Covered boundaries
+
+The hook covers:
+
+- trusted-hook initialization and ordinary factory start/success/failure, including module reuse;
+- extension tool registration and committed/discarded registration outcomes;
+- complete built-in, extension, MCP, and SDK tool registry refreshes with source ownership;
+- active-tool selection with distinct host, Extension API, handler-selection, transcript-restore, registry-refresh, initial-default, and resource-reload reasons; each applied value reports requested, active, callable, hidden, and model-declared tools;
+- every `prepareLoadout` callback, including stable shared input, source/parent identity, recovery after ordinary callback errors, and the native merged result;
+- extension resource discovery, empty/skipped/applied outcomes, direct stable override calls with normalized applied state, aggregate loaded resources including file-backed prompt content, and native loaded/added/replaced/removed/duplicate/rejected/reload outcomes with discovery cause links when known;
+- `before_agent_start`, `context`, `context_with_system`, and system-prompt section changes, including empty handler sets;
+- every fresh turn through `turn_preparation`;
+- replaceable `normalized_context` after common conversion/normalization, followed by a `final_context` observation for each provider attempt;
+- every late `before_provider_request` transformation, followed by `final_provider_context` with the same provider-attempt identity.
+
+Ordinary extension errors keep their existing behavior. The trusted hook still receives the retained candidate and a safe `{ "type": "error" }` or `{ "type": "non_error" }` fact before normal flow continues; arbitrary exception text is not exposed. A trusted-hook error is not downgraded to an ordinary extension warning.
+
+## Stable privacy boundary
+
+The trusted hook receives only system/tool context needed for provenance:
+
+- system instructions and structured sections;
+- tool definitions, ownership, selection, visibility, callability, and model declarations;
+- prompt snippets, tool and prompt guidelines, append prompt, context files, skills, resources, and normalized system-prompt options;
+- executable fields represented as `{ "kind": "callback" }` markers.
+
+It does not receive dialogue messages, tool results, credentials, UI/session metadata, timestamps, or complete provider payloads. At provider time Pi projects only known system/tool fields, including stable `role`/`content` from system or developer messages, string instructions, text content blocks stripped to `type`/`text`, OpenAI Responses `input`/`tool_choice`, and Google `config.systemInstruction`/`config.tools`/`config.toolConfig`. It applies accepted stable fields onto the original private templates, so unexposed block/message metadata and unrelated payload fields remain unchanged.
+
+This is a trusted in-process hook, not an OS sandbox. The extension module still executes with the user's privileges.

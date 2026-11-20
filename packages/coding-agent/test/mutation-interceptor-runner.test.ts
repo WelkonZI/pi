@@ -2,26 +2,26 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	getCurrentSystemMessage,
+	getSystemMessageText,
+	normalizeContext,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
 import type {
-	MutationInterceptEvent,
+	MutationInterceptionCall,
 	MutationInterceptor,
-	MutationStage,
+	MutationObservationCall,
 } from "../src/core/extensions/mutation-interceptor.ts";
+import type { MutationProviderContext } from "../src/core/extensions/mutation-interceptor-hooks.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
-import type {
-	ContextEvent,
-	ContextEventResult,
-	ContextWithSystemEvent,
-	ExtensionAPI,
-	ExtensionFactory,
-} from "../src/core/extensions/types.ts";
+import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import type { SourceInfo } from "../src/core/source-info.ts";
-import { buildSystemPrompt } from "../src/core/system-prompt.ts";
 import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
 let dir: string;
@@ -30,351 +30,309 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-const message = (text: string): AgentMessage => ({ role: "user", content: text, timestamp: 1 });
-const stages = ["before_agent_start", "context", "context_with_system", "before_provider_request"] as const;
-
-function onMessages(
-	pi: ExtensionAPI,
-	stage: "context" | "context_with_system",
-	handler: (event: ContextEvent | ContextWithSystemEvent) => ContextEventResult | undefined,
-) {
-	if (stage === "context") pi.on("context", handler);
-	else pi.on("context_with_system", handler);
-}
-
-function onStage(pi: ExtensionAPI, stage: (typeof stages)[number], handler: () => void) {
-	switch (stage) {
-		case "before_agent_start":
-			pi.on("before_agent_start", handler);
-			break;
-		case "context":
-			pi.on("context", handler);
-			break;
-		case "context_with_system":
-			pi.on("context_with_system", handler);
-			break;
-		case "before_provider_request":
-			pi.on("before_provider_request", handler);
-			break;
-	}
-}
-
-async function runnerFor(factories: ExtensionFactory[], interceptor?: MutationInterceptor) {
+async function runnerFor(factory: ExtensionFactory, interceptor: MutationInterceptor) {
 	const runtime = createExtensionRuntime();
-	const eventBus = createEventBus();
-	const extensions = await Promise.all(
-		factories.map((factory, index) => loadExtensionFromFactory(factory, dir, eventBus, runtime, `inline:${index}`)),
-	);
-	const sources: SourceInfo[] = extensions.map((extension, index) => {
-		const source: SourceInfo = {
-			path: extension.path,
-			source: "fixture",
-			scope: index === 0 ? "project" : "temporary",
-			origin: "top-level",
-		};
-		extension.sourceInfo = source;
-		return source;
-	});
-	if (interceptor)
-		runtime.mutationInterceptor = {
-			sourceInfo: { path: "fixture:user-interceptor", source: "fixture", scope: "user", origin: "top-level" },
-			interceptor,
-		};
-	const registry = await createInMemoryModelRegistry(AuthStorage.inMemory());
-	const runner = new ExtensionRunner(extensions, runtime, dir, SessionManager.inMemory(), registry);
-	return { runner, sources };
+	runtime.mutationInterceptor = {
+		sourceInfo: { path: "/hook.ts", source: "fixture", scope: "user", origin: "top-level" },
+		interceptor,
+	};
+	const extension = await loadExtensionFromFactory(factory, dir, createEventBus(), runtime, "inline:fixture");
+	extension.sourceInfo = { path: extension.path, source: "fixture", scope: "temporary", origin: "top-level" };
+	const sessionManager = SessionManager.inMemory();
+	const modelRegistry = await createInMemoryModelRegistry(AuthStorage.inMemory());
+	return new ExtensionRunner([extension], runtime, dir, sessionManager, modelRegistry);
 }
 
-async function trigger(runner: ExtensionRunner, stage: MutationStage) {
-	if (stage === "before_agent_start")
-		return runner.emitBeforeAgentStart({ messageType: "user", prompt: "hello" }, { cwd: dir, customPrompt: "base" });
-	if (stage === "before_provider_request") return runner.emitBeforeProviderRequest({ value: "base" });
-	return runner.emitContext([message("base")]);
-}
-
-describe("runner mutation boundaries", () => {
-	it("combines in-place and returned prompt changes, snapshots before, propagates replacement state", async () => {
-		const seen: MutationInterceptEvent[] = [];
-		const next: unknown[] = [];
-		const { runner, sources } = await runnerFor(
-			[
-				(pi) => {
-					pi.on("before_agent_start", (event) => {
-						event.systemPromptOptions.sections.guidance = "in-place";
-						return { systemPrompt: "returned" };
-					});
-					pi.on("before_agent_start", (event, ctx) => {
-						next.push(event.systemPromptOptions, ctx.getSystemPrompt());
-					});
-				},
-			],
-			(event) => {
-				seen.push(event);
-				if (seen.length === 1) return event.before;
-				return event.after;
-			},
-		);
-		const result = await trigger(runner, "before_agent_start");
-		expect(seen).toHaveLength(2);
-		expect(seen[0].stage).toBe("before_agent_start");
-		expect(seen[0].sourceInfo).toBe(sources[0]);
-		if (seen[0].stage !== "before_agent_start") throw new Error("wrong stage");
-		expect(seen[0].before.sections.guidance).not.toBe("in-place");
-		expect(seen[0].after.sections.guidance).toBe("in-place");
-		expect(seen[0].after.forceSystemPrompt).toBe("returned");
-		expect(next[0]).toBe(seen[0].before);
-		expect(next[1]).toBe(buildSystemPrompt(seen[0].before));
-		expect(result).toMatchObject({ systemPromptOptions: seen[0].before });
-	});
-
-	it.each(["context", "context_with_system"] as const)(
-		"intercepts %s handlers in order, including void returns and in-place edits",
-		async (stage) => {
-			const seen: MutationInterceptEvent[] = [];
-			const next: AgentMessage[][] = [];
-			const { runner, sources } = await runnerFor(
-				[
-					(pi) => {
-						onMessages(pi, stage, (event) => {
-							event.messages.push(message("in-place"));
-						});
-						onMessages(pi, stage, (event) => {
-							next.push(event.messages);
-							return { messages: [message("replacement")] };
-						});
-					},
-					(pi) => {
-						onMessages(pi, stage, (event) => {
-							next.push(event.messages);
-						});
-					},
-				],
-				(event) => {
-					seen.push(event);
-					return seen.length === 1 ? event.before : event.after;
-				},
-			);
-			const result = await runner.emitContext([message("base")]);
-			expect(seen.map((event) => event.stage)).toEqual([stage, stage, stage]);
-			expect(seen.map((event) => event.sourceInfo)).toEqual([sources[0], sources[0], sources[1]]);
-			expect(seen[0].sourceInfo).toBe(sources[0]);
-			expect(seen[2].sourceInfo).toBe(sources[1]);
-			expect(seen[0].before).toEqual([message("base")]);
-			expect(seen[0].after).toEqual([message("base"), message("in-place")]);
-			expect(next[0]).toEqual([message("base")]);
-			expect(next[1]).toEqual([message("replacement")]);
-			expect(result).toEqual([message("replacement")]);
+function recordingInterceptor(
+	calls: MutationInterceptionCall[],
+	change?: (call: MutationInterceptionCall<unknown>) => unknown,
+	observations: MutationObservationCall[] = [],
+): MutationInterceptor {
+	return {
+		intercept<T>(call: MutationInterceptionCall<T>): T {
+			calls.push(call);
+			return (change?.(call as MutationInterceptionCall<unknown>) ?? call.value) as T;
 		},
-	);
+		observe(call: MutationObservationCall): void {
+			observations.push(call);
+		},
+	};
+}
 
-	it("gives context only conversation and context_with_system the accepted complete transcript", async () => {
-		const seen: MutationInterceptEvent[] = [];
-		const system: AgentMessage = { role: "system", content: "", sections: { docs: "docs" }, timestamp: 0 };
-		const { runner } = await runnerFor(
-			[
-				(pi) => {
-					pi.on("context", () => ({ messages: [message("new")] }));
-					pi.on("context_with_system", () => {});
-				},
-			],
-			(event) => {
-				seen.push(event);
-				return event.after;
-			},
-		);
-		expect(await runner.emitContext([system, message("base")])).toEqual([system, message("new")]);
-		expect(seen[0].before).toEqual([message("base")]);
-		expect(seen[1].before).toEqual([system, message("new")]);
-	});
-
-	it("preserves handler-returned system entries in the context candidate and accepted result", async () => {
-		const original: AgentMessage = { role: "system", content: "", sections: { docs: "original" }, timestamp: 0 };
-		const injected: AgentMessage = { role: "system", content: "injected", timestamp: 1 };
-		let candidate: unknown;
-		const { runner } = await runnerFor([(pi) => {
-			pi.on("context", () => ({ messages: [injected, message("new")] }));
-		}], (event) => { candidate = event.after; return event.after; });
-		expect(await runner.emitContext([original, message("base")])).toEqual([original, injected, message("new")]);
-		expect(candidate).toEqual([injected, message("new")]);
-	});
-
-	it.each([true, false])("reports a missing leading system only for accepted state (revert: %s)", async (revert) => {
-		const system: AgentMessage = { role: "system", content: "", sections: { docs: "docs" }, timestamp: 0 };
-		const errors = vi.fn();
-		const { runner } = await runnerFor([(pi) => {
-			pi.on("context_with_system", (event) => ({ messages: revert ? [] : event.messages }));
-		}], (event) => revert ? event.before : []);
-		runner.onError(errors);
-		expect(await runner.emitContext([system, message("base")])).toEqual(revert ? [system, message("base")] : []);
-		expect(errors).toHaveBeenCalledTimes(revert ? 0 : 1);
-	});
-
-	it("propagates an accepted opaque null payload without restoring the candidate", async () => {
-		const seen: unknown[] = [];
-		const { runner } = await runnerFor([(pi) => {
-			pi.on("before_provider_request", () => ({ rejected: true }));
-			pi.on("before_provider_request", (event) => { seen.push(event.payload); });
-		}], () => null);
-		expect(await runner.emitBeforeProviderRequest({ base: true })).toBeNull();
-		expect(seen).toEqual([null]);
-	});
-
-	it("intercepts opaque payloads after in-place and returned edits without recursion", async () => {
-		const seen: MutationInterceptEvent[] = [];
-		const next: unknown[] = [];
-		const { runner, sources } = await runnerFor(
-			[
-				(pi) => {
-					pi.on("before_provider_request", (event) => {
-						(event.payload as { value: string }).value = "mutated";
-					});
-					pi.on("before_provider_request", (event) => {
-						next.push(event.payload);
-						return 42;
-					});
-					pi.on("before_provider_request", (event) => {
-						next.push(event.payload);
-					});
-				},
-			],
-			(event) => {
-				seen.push(event);
-				return seen.length === 1 ? event.before : event.after;
-			},
-		);
-		expect(await trigger(runner, "before_provider_request")).toBe(42);
-		expect(seen).toHaveLength(3);
-		expect(seen.every((event) => event.stage === "before_provider_request" && event.sourceInfo === sources[0])).toBe(
-			true,
-		);
-		expect(seen[0].before).toEqual({ value: "base" });
-		expect(seen[0].after).toEqual({ value: "mutated" });
-		expect(next).toEqual([{ value: "base" }, 42]);
-	});
-
-	it.each(stages)("propagates interceptor failures outside %s error recovery", async (stage) => {
-		let later = false;
-		const { runner } = await runnerFor(
-			[
-				(pi) => {
-					onStage(pi, stage, () => {});
-					onStage(pi, stage, () => {
-						later = true;
-					});
-				},
-			],
-			() => {
-				throw new Error("interception failed");
-			},
-		);
-		const errors = vi.fn();
-		runner.onError(errors);
-		await expect(trigger(runner, stage)).rejects.toThrow(`failed at ${stage}`);
-		expect(errors).not.toHaveBeenCalled();
-		expect(later).toBe(false);
-	});
-
-	it.each(stages)("keeps ordinary %s errors recoverable", async (stage) => {
-		let intercepted = 0;
-		let later = false;
-		const { runner } = await runnerFor(
-			[
-				(pi) => {
-					onStage(pi, stage, () => {
-						throw new Error("ordinary error");
-					});
-					onStage(pi, stage, () => {
-						later = true;
-					});
-				},
-			],
-			(event) => {
-				intercepted++;
-				return event.after;
-			},
-		);
-		const errors = vi.fn();
-		runner.onError(errors);
-		await trigger(runner, stage);
-		expect(errors).toHaveBeenCalledOnce();
-		expect(later).toBe(true);
-		expect(intercepted).toBe(1);
-	});
-
-	it("fails closed with attributed cause before running a handler on noncloneable payloads", async () => {
-		const handler = vi.fn();
-		const interceptor = vi.fn((event: MutationInterceptEvent) => event.after);
-		const { runner, sources } = await runnerFor(
-			[
-				(pi) => {
-					pi.on("before_provider_request", handler);
-				},
-			],
-			interceptor,
-		);
-		const failure = await runner.emitBeforeProviderRequest({ callback() {} }).catch((error: unknown) => error);
-		expect(failure).toBeInstanceOf(Error);
-		if (!(failure instanceof Error)) throw new Error("expected snapshot failure");
-		expect(failure.message).toContain(`failed at before_provider_request for ${sources[0].path}`);
-		expect(failure.message).toContain("fixture:user-interceptor");
-		expect(failure.cause).toMatchObject({ name: "DataCloneError" });
-		expect(handler).not.toHaveBeenCalled();
-		expect(interceptor).not.toHaveBeenCalled();
-	});
-
-	it("does not return an in-place rejected payload when the interceptor returns undefined", async () => {
-		let later = false;
-		const { runner } = await runnerFor(
-			[
-				(pi) => {
-					pi.on("before_provider_request", (event) => {
-						(event.payload as { value: string }).value = "rejected";
-					});
-					pi.on("before_provider_request", () => {
-						later = true;
-					});
-				},
-			],
-			() => undefined,
-		);
-		await expect(runner.emitBeforeProviderRequest({ value: "base" })).rejects.toThrow(
-			"failed at before_provider_request",
-		);
-		expect(later).toBe(false);
-	});
-
-	it("propagates a fresh replacement array to the next handler", async () => {
-		const seen: AgentMessage[][] = [];
-		const { runner } = await runnerFor(
-			[
-				(pi) => {
-					pi.on("context", () => ({ messages: [message("candidate")] }));
-					pi.on("context", (event) => {
-						seen.push(event.messages);
-					});
-				},
-			],
-			(event) => (event.stage === "context" ? [] : event.after),
-		);
-		expect(await runner.emitContext([message("base")])).toEqual([]);
-		expect(seen).toEqual([[]]);
-	});
-
-	it("makes no new snapshots without registration and retains existing provider behavior", async () => {
-		const { runner } = await runnerFor([
+describe("runner trusted mutation boundaries", () => {
+	it("projects only provider system/tool context and restores unrelated payload fields", async () => {
+		const calls: MutationInterceptionCall[] = [];
+		const runner = await runnerFor(
 			(pi) => {
-				pi.on("before_provider_request", () => undefined);
-				pi.on("before_agent_start", () => ({ systemPrompt: "unchanged behavior" }));
+				pi.on("before_provider_request", (event) => ({
+					...(event.payload as Record<string, unknown>),
+					system: "ordinary",
+					apiKey: "ordinary-secret",
+				}));
 			},
+			recordingInterceptor(calls, (call) => {
+				if (call.operation !== "before_provider_request" || call.phase !== "candidate") return call.value;
+				const projection = call.value as MutationProviderContext;
+				return {
+					...projection,
+					fields: { ...projection.fields, system: "accepted" },
+					systemMessages: projection.systemMessages.map((message) => ({
+						...message,
+						content: "accepted message",
+					})),
+				};
+			}),
+		);
+		const payload = {
+			system: "base",
+			apiKey: "private",
+			messages: [
+				{
+					role: "system",
+					content: "system",
+					timestamp: 1,
+					sessionMetadata: "system-message-private-metadata",
+				},
+				{ role: "user", content: "user-secret", timestamp: 1 },
+			],
+		};
+		const result = (await runner.emitBeforeProviderRequest(payload)) as typeof payload;
+		expect(result.system).toBe("accepted");
+		expect(result.apiKey).toBe("ordinary-secret");
+		expect(result.messages[0]).toEqual({
+			role: "system",
+			content: "accepted message",
+			timestamp: 1,
+			sessionMetadata: "system-message-private-metadata",
+		});
+		expect(result.messages[1].content).toBe("user-secret");
+		const exposed = JSON.stringify(calls.map((call) => call.value));
+		expect(exposed).not.toContain("user-secret");
+		expect(exposed).not.toContain("apiKey");
+		expect(exposed).not.toContain("system-message-private-metadata");
+		expect(exposed).not.toContain("timestamp");
+		expect(calls.some((call) => call.operation === "final_provider_context")).toBe(true);
+	});
+
+	it("projects real Responses and Google provider fields without changing identity payloads", async () => {
+		const calls: MutationInterceptionCall[] = [];
+		const runner = await runnerFor(
+			() => {},
+			recordingInterceptor(calls, (call) => {
+				if (call.operation !== "final_provider_context" || call.phase !== "candidate") return call.value;
+				const projection = call.value as MutationProviderContext;
+				return {
+					...projection,
+					fields: {
+						...projection.fields,
+						...(Array.isArray(projection.fields.system)
+							? { system: [{ type: "text", text: "accepted-system" }] }
+							: {}),
+						...(projection.fields["config.systemInstruction"] !== undefined
+							? { "config.systemInstruction": "accepted-google" }
+							: {}),
+					},
+				};
+			}),
+		);
+		const anthropic = {
+			system: [{ type: "text", text: "anthropic-system", cache_control: "private-cache-metadata" }],
+			messages: [{ role: "user", content: "anthropic-secret" }],
+		};
+		const anthropicResult = (await runner.emitBeforeProviderRequest(anthropic)) as typeof anthropic;
+		expect(anthropicResult.system).toEqual([
+			{ type: "text", text: "accepted-system", cache_control: "private-cache-metadata" },
 		]);
-		const clone = vi.spyOn(globalThis, "structuredClone");
-		try {
-			const payload = { callback() {} };
-			expect(await runner.emitBeforeProviderRequest(payload)).toBe(payload);
-			await trigger(runner, "before_agent_start");
-			expect(clone).not.toHaveBeenCalled();
-		} finally {
-			clone.mockRestore();
+		const responses = {
+			input: [
+				{ role: "system", content: "responses-system" },
+				{ role: "user", content: "responses-secret" },
+			],
+			tools: [{ type: "function", name: "sample" }],
+			tool_choice: "auto",
+			apiKey: "responses-key",
+		};
+		const responsesResult = await runner.emitBeforeProviderRequest(responses);
+		expect(responsesResult).toEqual(responses);
+		const google = {
+			contents: [{ role: "user", parts: [{ text: "google-secret" }] }],
+			config: {
+				systemInstruction: "google-system",
+				tools: [{ functionDeclarations: [{ name: "sample" }] }],
+				toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+				abortSignal: "private-signal",
+			},
+			apiKey: "google-key",
+		};
+		const googleResult = (await runner.emitBeforeProviderRequest(google)) as typeof google;
+		expect(googleResult.config.systemInstruction).toBe("accepted-google");
+		expect(googleResult.config.abortSignal).toBe("private-signal");
+		expect(googleResult.contents).toEqual(google.contents);
+		const exposed = JSON.stringify(calls.map((call) => call.value));
+		expect(exposed).not.toContain("anthropic-secret");
+		expect(exposed).not.toContain("private-cache-metadata");
+		expect(exposed).not.toContain("responses-secret");
+		expect(exposed).not.toContain("responses-key");
+		expect(exposed).not.toContain("google-secret");
+		expect(exposed).not.toContain("google-key");
+		expect(exposed).not.toContain("private-signal");
+	});
+
+	it("removes provider instructions and applies tools-only late mutations without changing unrelated payload", async () => {
+		const runner = await runnerFor(
+			() => {},
+			recordingInterceptor([], (call) => {
+				if (call.operation !== "final_provider_context" || call.phase !== "candidate") return call.value;
+				const projection = call.value as MutationProviderContext;
+				const { system: _system, ...fields } = projection.fields;
+				projection.fields = { ...fields, tools: [{ name: "accepted" }] };
+				return projection;
+			}),
+		);
+		const result = (await runner.emitBeforeProviderRequest({
+			system: "remove me",
+			tools: [{ name: "original" }],
+			metadata: { secret: "preserved outside projection" },
+		})) as Record<string, unknown>;
+		expect(result).not.toHaveProperty("system");
+		expect(result.tools).toEqual([{ name: "accepted" }]);
+		expect(result.metadata).toEqual({ secret: "preserved outside projection" });
+	});
+
+	it("preserves normalized meaning and dialogue when the trusted candidate is unchanged", async () => {
+		const runner = await runnerFor(() => {}, {
+			intercept<T>(call: MutationInterceptionCall<T>): T {
+				return call.value;
+			},
+			observe(): void {},
+		});
+		const context = {
+			messages: [
+				{ role: "system", content: "first", timestamp: 1 },
+				{ role: "user", content: "private dialogue", timestamp: 2 },
+				{ role: "system", content: "second", timestamp: 3 },
+			],
+		} as TranscriptContext;
+		const result = runner.emitNormalizedFinal(context);
+		expect(getSystemMessageText(getCurrentSystemMessage(result.messages)!)).toBe("first\n\nsecond");
+		expect(result.messages.find((message) => message.role === "user")).toBe(context.messages[1]);
+	});
+
+	it("accepts an explicitly empty normalized system/tool context without removing dialogue", async () => {
+		const runner = await runnerFor(
+			() => {},
+			recordingInterceptor([], (call) =>
+				call.operation === "normalized_context" && call.phase === "candidate"
+					? { systemInstructions: "", tools: [] }
+					: call.value,
+			),
+		);
+		const result = runner.emitNormalizedFinal(
+			normalizeContext({
+				systemPrompt: "remove me",
+				tools: [{ name: "sample", description: "sample", parameters: Type.Object({}) }],
+				messages: [{ role: "user", content: "private dialogue", timestamp: 1 }],
+			}),
+		);
+		expect(getCurrentSystemMessage(result.messages)).toBeUndefined();
+		expect(result.messages).toEqual([{ role: "user", content: "private dialogue", timestamp: 1 }]);
+	});
+
+	it("replaces normalized system/tool context and emits one FINAL per provider attempt", async () => {
+		const calls: MutationInterceptionCall[] = [];
+		const observations: MutationObservationCall[] = [];
+		const runner = await runnerFor(
+			() => {},
+			recordingInterceptor(
+				calls,
+				(call) => {
+					if (call.operation !== "normalized_context" || call.phase !== "candidate") return call.value;
+					const value = call.value as { systemInstructions: string; tools: readonly unknown[] };
+					value.systemInstructions = `${value.systemInstructions}\nTrusted final.`;
+					return value;
+				},
+				observations,
+			),
+		);
+		const context: TranscriptContext = normalizeContext({
+			messages: [
+				{ role: "system", content: "base", timestamp: 1 },
+				{ role: "user", content: "private dialogue", timestamp: 1 },
+			],
+		});
+		const first = runner.emitNormalizedFinal(context);
+		await runner.emitBeforeProviderRequest({ system: "first" });
+		const second = runner.emitNormalizedFinal(context);
+		await runner.emitBeforeProviderRequest({ system: "second" });
+		for (const result of [first, second]) {
+			expect(getSystemMessageText(getCurrentSystemMessage(result.messages)!)).toContain("Trusted final.");
+			expect(result.messages.some((message) => message.role === "user")).toBe(true);
 		}
+		const finals = observations.filter((call) => call.operation === "final_context" && call.outcome === "final");
+		expect(finals).toHaveLength(2);
+		expect(new Set(finals.map((call) => call.providerAttemptId)).size).toBe(2);
+		const providerAttempts = calls
+			.filter((call) => call.operation === "final_provider_context" && call.phase === "candidate")
+			.map((call) => call.providerAttemptId);
+		expect(providerAttempts).toEqual(finals.map((call) => call.providerAttemptId));
+		expect(JSON.stringify(calls.map((call) => call.value))).not.toContain("private dialogue");
+	});
+
+	it("reports empty handler sets as factual skipped outcomes", async () => {
+		const observations: MutationObservationCall[] = [];
+		const runner = await runnerFor(() => {}, recordingInterceptor([], undefined, observations));
+		await runner.emitContext([{ role: "system", content: "system", timestamp: 1 }]);
+		await runner.emitResourcesDiscover(dir, "startup");
+		await runner.emitBeforeProviderRequest({ system: "system" });
+		expect(
+			observations
+				.filter((call) => call.outcome === "skipped")
+				.map((call) => call.operation)
+				.sort(),
+		).toEqual(["before_provider_request", "context", "context_with_system", "resources_discover"]);
+	});
+
+	it("reports ordinary handler errors while intercepting the retained stable state", async () => {
+		const calls: MutationInterceptionCall[] = [];
+		const runner = await runnerFor((pi) => {
+			pi.on("context_with_system", () => {
+				throw new Error("ordinary failed");
+			});
+		}, recordingInterceptor(calls));
+		const messages: AgentMessage[] = [
+			{ role: "system", content: "system", timestamp: 1 },
+			{ role: "user", content: "private dialogue", timestamp: 1 },
+		];
+		const result = await runner.emitContext(messages);
+		expect(result.map((message) => [message.role, "content" in message ? message.content : null])).toEqual([
+			["system", "system"],
+			["user", "private dialogue"],
+		]);
+		const operationCalls = calls.filter((call) => call.operation === "context_with_system");
+		expect(operationCalls.map((call) => call.phase)).toEqual(["before", "candidate", "applied"]);
+		expect(operationCalls[1].error).toEqual({ type: "error" });
+		expect(JSON.stringify(operationCalls)).not.toContain("private dialogue");
+	});
+
+	it("lets the trusted hook supply a resource candidate after an ordinary error", async () => {
+		const calls: MutationInterceptionCall[] = [];
+		const runner = await runnerFor(
+			(pi) => {
+				pi.on("resources_discover", () => {
+					throw new Error("discovery failed");
+				});
+			},
+			recordingInterceptor(calls, (call) => {
+				if (call.operation === "resources_discover" && call.phase === "candidate") {
+					return { skillPaths: ["/accepted/SKILL.md"], promptPaths: [], themePaths: [] };
+				}
+				return call.value;
+			}),
+		);
+		const result = await runner.emitResourcesDiscover(dir, "startup");
+		expect(result.skillPaths).toEqual([{ path: "/accepted/SKILL.md", extensionPath: "inline:fixture" }]);
+		expect(
+			calls.find((call) => call.operation === "resources_discover" && call.phase === "candidate")?.error,
+		).toEqual({ type: "error" });
 	});
 });

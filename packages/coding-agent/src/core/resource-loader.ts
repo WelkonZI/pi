@@ -17,7 +17,10 @@ import {
 	loadExtensionFromFactory,
 	loadExtensionsCached,
 } from "./extensions/loader.ts";
+import { rethrowTrustedMutationInterceptorError } from "./extensions/mutation-interceptor.ts";
 import { hasFactorySource } from "./extensions/mutation-interceptor-loader.ts";
+// biome-ignore format: minimize fork diff
+import { applyAcceptedPrompts, applyAcceptedSkills, applyResourceOverride, beginLoadedResourcesMutation, observeNativeResources, observeResourceReload, projectNativeResourceState } from "./extensions/mutation-interceptor-resources.ts";
 import type {
 	Extension,
 	ExtensionFactory,
@@ -387,6 +390,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private appendSystemPromptOverride?: (base: string[]) => string[];
 
 	private extensionsResult: LoadExtensionsResult;
+	private loadingExtensionRuntime?: ExtensionRuntime;
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
 	private prompts: PromptTemplate[];
@@ -500,6 +504,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	extendResources(paths: ResourceExtensionPaths): void {
+		const nativeResourcesBefore = this.snapshotMutationNativeResourceState().resources;
 		const skillPaths = this.normalizeExtensionPaths(paths.skillPaths ?? []);
 		const promptPaths = this.normalizeExtensionPaths(paths.promptPaths ?? []);
 		const themePaths = this.normalizeExtensionPaths(paths.themePaths ?? []);
@@ -537,17 +542,63 @@ export class DefaultResourceLoader implements ResourceLoader {
 			);
 			this.updateThemesFromPaths(this.lastThemePaths, this.resourceMetadataByPath);
 		}
+		if (skillPaths.length > 0 || promptPaths.length > 0 || themePaths.length > 0) {
+			this.observeMutationNativeResources(nativeResourcesBefore, "extension_discovery");
+		}
 	}
 
-	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
+	async loadProjectTrustExtensions(runtime?: ExtensionRuntime): Promise<LoadExtensionsResult> {
 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
 		// extensions/packages out while still loading user/global and temporary CLI extensions.
 		this.settingsManager.setProjectTrusted(false);
 		await this.settingsManager.reload();
-		return this.loadCurrentExtensionSet({ includeInlineFactories: true });
+		return this.loadCurrentExtensionSet({ includeInlineFactories: true }, runtime);
 	}
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
+		const reason = this.loaded ? "reload" : "startup";
+		const previousRuntime = this.extensionsResult?.runtime;
+		observeResourceReload(previousRuntime, "started", reason);
+		try {
+			await this.reloadResources(options);
+		} catch (error) {
+			const loadingRuntime = this.loadingExtensionRuntime;
+			this.loadingExtensionRuntime = undefined;
+			const failedRuntime = loadingRuntime?.mutationInterceptor
+				? loadingRuntime
+				: (this.extensionsResult?.runtime ?? previousRuntime);
+			observeResourceReload(failedRuntime, "failed", reason, error);
+			throw error;
+		}
+		this.loadingExtensionRuntime = undefined;
+		observeResourceReload(this.extensionsResult.runtime, "succeeded", reason);
+	}
+
+	private getMutationResourceCause(path: string): { callId: string; sourceInfo: SourceInfo } | undefined {
+		for (const [contributedPath, contribution] of this.extensionsResult?.runtime.mutationResourceContributions ??
+			[]) {
+			const resolved = this.resolveResourcePath(contributedPath);
+			if (pathsEqual(path, resolved) || isPathWithin(resolved, path)) return contribution;
+		}
+		return undefined;
+	}
+
+	private snapshotMutationNativeResourceState() {
+		// biome-ignore format: minimize fork diff
+		return projectNativeResourceState(this, (path, kind) => kind === "context_file" && !existsSync(path) ? null : this.getDefaultSourceInfoForPath(path), (path) => this.getMutationResourceCause(path));
+	}
+
+	// biome-ignore format: minimize fork diff
+	private observeMutationNativeResources(before: ReturnType<typeof projectNativeResourceState>["resources"], reason: string): void {
+		const current = this.snapshotMutationNativeResourceState();
+		observeNativeResources(this.extensionsResult.runtime, before, current.resources, current.diagnostics, reason);
+	}
+
+	private async reloadResources(options?: ResourceLoaderReloadOptions): Promise<void> {
+		const nativeReason = this.loaded ? "reload" : "startup";
+		const loadingRuntime = createExtensionRuntime();
+		this.loadingExtensionRuntime = loadingRuntime;
+		const nativeResourcesBefore = this.snapshotMutationNativeResourceState().resources;
 		resetTimings("extensions");
 
 		if (this.loaded) {
@@ -556,7 +607,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		let preTrustExtensions: LoadExtensionsResult | undefined;
 		if (options?.resolveProjectTrust) {
-			preTrustExtensions = await this.loadProjectTrustExtensions();
+			preTrustExtensions = await this.loadProjectTrustExtensions(loadingRuntime);
 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
 			this.settingsManager.setProjectTrusted(projectTrusted);
 		}
@@ -574,6 +625,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		// Kept on the instance so post-reload passes (extendResources) can still resolve package metadata.
 		this.resourceMetadataByPath = new Map();
 		const metadataByPath = this.resourceMetadataByPath;
+		const trustedHookPath = this.settingsManager.getGlobalSettings().trustedMutationHook;
+		if (trustedHookPath) {
+			metadataByPath.set(trustedHookPath, { source: "settings", scope: "user", origin: "top-level" });
+		}
 
 		this.extensionSkillSourceInfos = new Map();
 		this.extensionPromptSourceInfos = new Map();
@@ -624,7 +679,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 		);
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
-		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions, metadataByPath);
+		// biome-ignore format: minimize fork diff
+		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions, metadataByPath, loadingRuntime);
 		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 		for (const p of this.additionalExtensionPaths) {
 			if (isLocalPath(p)) {
@@ -692,12 +748,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 						agentDir: this.agentDir,
 					}),
 		};
-		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
-		this.agentsFiles = resolvedAgentsFiles.agentsFiles;
+		// biome-ignore format: minimize fork diff
+		applyResourceOverride(this.extensionsResult.runtime, "context_files_override", agentsFiles, this.agentsFilesOverride, (value) => { this.agentsFiles = value.agentsFiles; return { agentsFiles: this.agentsFiles }; });
 
 		const systemPromptSource = this.systemPromptSource ?? this.discoverSystemPromptFile();
 		const baseSystemPrompt = resolvePromptInput(systemPromptSource, "system prompt");
-		this.systemPrompt = this.systemPromptOverride ? this.systemPromptOverride(baseSystemPrompt) : baseSystemPrompt;
+		// biome-ignore format: minimize fork diff
+		applyResourceOverride(this.extensionsResult.runtime, "system_prompt_override", baseSystemPrompt, this.systemPromptOverride, (value) => { this.systemPrompt = value; return this.systemPrompt; });
 		this.systemPromptSourcePath =
 			systemPromptSource && existsSync(systemPromptSource) ? resolvePath(systemPromptSource) : undefined;
 
@@ -709,16 +766,27 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const baseAppend = appendSources
 			.map((s) => resolvePromptInput(s, "append system prompt"))
 			.filter((s): s is string => s !== undefined);
-		this.appendSystemPrompt = this.appendSystemPromptOverride
-			? this.appendSystemPromptOverride(baseAppend)
-			: baseAppend;
+		// biome-ignore format: minimize fork diff
+		applyResourceOverride(this.extensionsResult.runtime, "append_system_prompt_override", baseAppend, this.appendSystemPromptOverride, (value) => { this.appendSystemPrompt = value; return this.appendSystemPrompt; });
 		this.appendSystemPromptSourcePaths = appendSources
 			.filter((source) => existsSync(source))
 			.map((source) => resolvePath(source));
+
+		// biome-ignore format: minimize fork diff
+		const resourcesMutation = beginLoadedResourcesMutation(this.extensionsResult.runtime, this, this.loaded ? "reload" : "startup");
+		const acceptedResources = resourcesMutation.accepted;
+		this.systemPrompt = acceptedResources.systemPrompt ?? undefined;
+		this.appendSystemPrompt = [...acceptedResources.appendSystemPrompt];
+		this.agentsFiles = acceptedResources.contextFiles.map((file) => ({ ...file }));
+		this.skills = applyAcceptedSkills(this.skills, acceptedResources.skills);
+		this.prompts = applyAcceptedPrompts(this.prompts, acceptedResources.prompts);
 		this.loaded = true;
+		resourcesMutation.applied();
+		this.observeMutationNativeResources(nativeResourcesBefore, nativeReason);
 	}
 
-	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {
+	// biome-ignore format: minimize fork diff
+	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }, runtime?: ExtensionRuntime): Promise<LoadExtensionsResult> {
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
@@ -736,12 +804,17 @@ export class DefaultResourceLoader implements ResourceLoader {
 				resource.metadata,
 			]),
 		);
+		const trustedHookPath = this.settingsManager.getGlobalSettings().trustedMutationHook;
+		if (trustedHookPath && !metadataByPath.has(trustedHookPath)) {
+			metadataByPath.set(trustedHookPath, { source: "settings", scope: "user", origin: "top-level" });
+		}
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
 		const installWarnings = collectPackageInstallWarnings(
 			resolvedPaths.installFailures,
 			cliExtensionPaths.installFailures,
 		);
-		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus, undefined, metadataByPath);
+		// biome-ignore format: minimize fork diff
+		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus, runtime, metadataByPath, trustedHookPath);
 		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;
@@ -765,6 +838,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	/** Load extension paths: files from disk and `builtin:<name>` paths from the built-in extensions. */
+	// biome-ignore format: minimize fork diff
 	private async loadExtensionPaths(paths: string[], runtime?: ExtensionRuntime, metadataByPath?: Map<string, PathMetadata>): Promise<LoadExtensionsResult> {
 		const isBuiltinPath = (path: string) => path.startsWith(BUILTIN_PATH_PREFIX);
 		const result = await loadExtensionsCached(
@@ -773,6 +847,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			this.eventBus,
 			runtime,
 			metadataByPath,
+			this.settingsManager.getGlobalSettings().trustedMutationHook,
 		);
 		for (const path of paths.filter(isBuiltinPath)) {
 			const builtin = this.builtinExtensions.get(path.slice(BUILTIN_PATH_PREFIX.length));
@@ -792,17 +867,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extension.replaceable = builtin.replaceable === true;
 				result.extensions.push(extension);
 			} catch (error) {
+				rethrowTrustedMutationInterceptorError(error);
 				result.errors.push({ path, error: error instanceof Error ? error.message : "failed to load extension" });
 			}
 		}
 		return result;
 	}
 
-	private async loadFinalExtensionSet(
-		extensionPaths: string[],
-		preTrustExtensions: LoadExtensionsResult | undefined,
-		metadataByPath: Map<string, PathMetadata>,
-	): Promise<LoadExtensionsResult> {
+	// biome-ignore format: minimize fork diff
+	private async loadFinalExtensionSet(extensionPaths: string[], preTrustExtensions: LoadExtensionsResult | undefined, metadataByPath: Map<string, PathMetadata>, runtime: ExtensionRuntime): Promise<LoadExtensionsResult> {
 		// Without a pre-trust pass nothing is preloaded, and inline extensions load here.
 		const preloaded = preTrustExtensions?.extensions ?? [];
 		const preloadedByPath = new Map(
@@ -817,7 +890,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 			const pathKey = this.getExtensionPathKey(path);
 			return !preloadedByPath.has(pathKey) && !failedPreloadPaths.has(pathKey);
 		});
-		const remainingExtensions = await this.loadExtensionPaths(remainingPaths, preTrustExtensions?.runtime, metadataByPath);
+		// biome-ignore format: minimize fork diff
+		const remainingExtensions = await this.loadExtensionPaths(remainingPaths, preTrustExtensions?.runtime ?? runtime, metadataByPath);
 		const loadedByPath = new Map(preloadedByPath);
 		for (const extension of remainingExtensions.extensions) {
 			loadedByPath.set(getResourcePathKey(extension.resolvedPath), extension);
@@ -900,15 +974,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 				includeDefaults: false,
 			});
 		}
-		const resolvedSkills = this.skillsOverride ? this.skillsOverride(skillsResult) : skillsResult;
-		this.skills = resolvedSkills.skills.map((skill) => ({
-			...skill,
-			sourceInfo:
-				this.findSourceInfoForPath(skill.filePath, this.extensionSkillSourceInfos, metadataByPath) ??
-				skill.sourceInfo ??
-				this.getDefaultSourceInfoForPath(skill.filePath),
-		}));
-		this.skillDiagnostics = resolvedSkills.diagnostics;
+		// biome-ignore format: minimize fork diff
+		const applySkills = (value: { skills: Skill[]; diagnostics: ResourceDiagnostic[] }): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } => {
+			this.skills = value.skills.map((skill) => ({
+				...skill,
+				sourceInfo:
+					this.findSourceInfoForPath(skill.filePath, this.extensionSkillSourceInfos, metadataByPath) ??
+					skill.sourceInfo ??
+					this.getDefaultSourceInfoForPath(skill.filePath),
+			}));
+			this.skillDiagnostics = value.diagnostics;
+			return { skills: this.skills, diagnostics: this.skillDiagnostics };
+		};
+		// biome-ignore format: minimize fork diff
+		applyResourceOverride(this.extensionsResult.runtime, "skills_override", skillsResult, this.skillsOverride, applySkills);
 	}
 
 	private updatePromptsFromPaths(promptPaths: string[], metadataByPath?: Map<string, PathMetadata>): void {
@@ -928,15 +1007,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 				diagnostics: [...loaded.diagnostics, ...deduped.diagnostics],
 			};
 		}
-		const resolvedPrompts = this.promptsOverride ? this.promptsOverride(promptsResult) : promptsResult;
-		this.prompts = resolvedPrompts.prompts.map((prompt) => ({
-			...prompt,
-			sourceInfo:
-				this.findSourceInfoForPath(prompt.filePath, this.extensionPromptSourceInfos, metadataByPath) ??
-				prompt.sourceInfo ??
-				this.getDefaultSourceInfoForPath(prompt.filePath),
-		}));
-		this.promptDiagnostics = resolvedPrompts.diagnostics;
+		// biome-ignore format: minimize fork diff
+		const applyPrompts = (value: { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] }): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] } => {
+			this.prompts = value.prompts.map((prompt) => ({
+				...prompt,
+				sourceInfo:
+					this.findSourceInfoForPath(prompt.filePath, this.extensionPromptSourceInfos, metadataByPath) ??
+					prompt.sourceInfo ??
+					this.getDefaultSourceInfoForPath(prompt.filePath),
+			}));
+			this.promptDiagnostics = value.diagnostics;
+			return { prompts: this.prompts, diagnostics: this.promptDiagnostics };
+		};
+		// biome-ignore format: minimize fork diff
+		applyResourceOverride(this.extensionsResult.runtime, "prompts_override", promptsResult, this.promptsOverride, applyPrompts);
 	}
 
 	private updateThemesFromPaths(themePaths: string[], metadataByPath?: Map<string, PathMetadata>): void {
@@ -1193,6 +1277,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extension.replaceable = isNamed && input.replaceable === true;
 				extensions.push(extension);
 			} catch (error) {
+				rethrowTrustedMutationInterceptorError(error);
 				const message = error instanceof Error ? error.message : "failed to load extension";
 				errors.push({ path: extensionPath, error: message });
 			}

@@ -319,6 +319,11 @@ export const SettingsSchema = Type.Object(
 		extensions: Type.Optional(
 			Type.Array(Type.String(), { description: "Local extension file paths or directories." }),
 		),
+		trustedMutationHook: Type.Optional(
+			Type.String({
+				description: "User-scope extension module that declares the trusted mutation hook. Global only.",
+			}),
+		),
 		deviceId: Type.Optional(
 			Type.String({
 				description: "Stable installation UUID, generated when authentication first needs it. Global only.",

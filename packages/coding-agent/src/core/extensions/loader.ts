@@ -21,7 +21,8 @@ import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
-import { type FactorySources, mutationLoad } from "./mutation-interceptor-loader.ts";
+import { TrustedMutationInterceptorError } from "./mutation-interceptor.ts";
+import { bootstrapMutationInterceptor, type FactorySources, mutationLoad } from "./mutation-interceptor-loader.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -309,7 +310,7 @@ function createExtensionAPI(
 				definition: tool,
 				sourceInfo: extension.sourceInfo,
 			});
-			runtime.refreshTools();
+			runtime.refreshTools(extension.sourceInfo);
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
@@ -445,7 +446,7 @@ function createExtensionAPI(
 
 		setActiveTools(toolNames: string[]): void {
 			assertActive();
-			runtime.setActiveTools(toolNames);
+			runtime.setActiveTools(toolNames, extension.sourceInfo);
 		},
 
 		getCommands() {
@@ -585,11 +586,15 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
-async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
+// biome-ignore format: minimize fork diff
+interface LoadedExtensionFactory { factory: ExtensionFactory; reused: boolean }
+
+// biome-ignore format: minimize fork diff
+async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken): Promise<LoadedExtensionFactory | undefined> {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
 		if (cachedFactory) {
-			return cachedFactory;
+			return { factory: cachedFactory, reused: true };
 		}
 	}
 
@@ -615,7 +620,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 	if (isCurrentCacheToken(cacheToken)) {
 		extensionCache.set(extensionPath, factory);
 	}
-	return factory;
+	return { factory, reused: false };
 }
 
 /**
@@ -647,14 +652,16 @@ async function initializeExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	sources?: FactorySources,
+	moduleReused = false,
 ): Promise<Extension> {
 	const extension = createExtension(extensionPath, resolvedPath);
-	const load = mutationLoad(extension, runtime, sources, () => createExtensionAPI(extension, runtime, cwd, eventBus));
+	// biome-ignore format: minimize fork diff
+	const load = mutationLoad(extension, runtime, sources, moduleReused, () => createExtensionAPI(extension, runtime, cwd, eventBus));
 	try {
 		await factory(load.api);
 		load.commit();
 	} catch (error) {
-		load.discard();
+		load.discard(error);
 		throw error;
 	}
 	time(`${extensionPath} factory`, "extensions");
@@ -668,20 +675,23 @@ async function loadExtension(
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
 	sources?: FactorySources,
+	preloaded?: ReadonlyMap<string, LoadedExtensionFactory>,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
+		const loaded = preloaded?.get(resolvedPath) ?? (await loadExtensionModule(resolvedPath, cacheToken));
 		time(`${extensionPath} module import`, "extensions");
-		if (!factory) {
+		if (!loaded) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
-		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime, sources);
+		// biome-ignore format: keep the personal-fork call-site diff minimal
+		const extension = await initializeExtension(loaded.factory, extensionPath, resolvedPath, cwd, eventBus, runtime, sources, loaded.reused);
 
 		return { extension, error: null };
 	} catch (err) {
+		if (err instanceof TrustedMutationInterceptorError) throw err;
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
@@ -711,6 +721,7 @@ async function loadExtensionsInternal(
 	runtime?: ExtensionRuntime,
 	useCache = false,
 	metadataByPath?: FactorySources,
+	trustedHookPath?: string,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
@@ -719,6 +730,15 @@ async function loadExtensionsInternal(
 	const resolvedCwd = cacheToken?.cwd ?? resolvePath(cwd);
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const resolvedRuntime = runtime ?? createExtensionRuntime();
+	const preloaded = new Map<string, LoadedExtensionFactory>();
+	if (trustedHookPath && !resolvedRuntime.mutationInterceptor) {
+		const resolvedHookPath = resolvePath(trustedHookPath, resolvedCwd, { normalizeUnicodeSpaces: true });
+		const loaded = await loadExtensionModule(resolvedHookPath, cacheToken);
+		if (!loaded)
+			throw new Error(`Trusted mutation hook does not export a valid extension factory: ${trustedHookPath}`);
+		preloaded.set(resolvedHookPath, loaded);
+		bootstrapMutationInterceptor(trustedHookPath, resolvedHookPath, loaded.factory, resolvedRuntime, metadataByPath);
+	}
 
 	for (const extPath of paths) {
 		const { extension, error } = await loadExtension(
@@ -728,6 +748,7 @@ async function loadExtensionsInternal(
 			resolvedRuntime,
 			cacheToken,
 			metadataByPath,
+			preloaded,
 		);
 
 		if (error) {
@@ -754,8 +775,9 @@ export async function loadExtensions(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	metadataByPath?: FactorySources,
+	trustedHookPath?: string,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime, false, metadataByPath);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, false, metadataByPath, trustedHookPath);
 }
 
 export async function loadExtensionsCached(
@@ -764,8 +786,9 @@ export async function loadExtensionsCached(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	metadataByPath?: FactorySources,
+	trustedHookPath?: string,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true, metadataByPath);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true, metadataByPath, trustedHookPath);
 }
 
 function isExtensionFile(name: string): boolean {

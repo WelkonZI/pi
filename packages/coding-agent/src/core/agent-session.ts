@@ -114,7 +114,12 @@ import {
 	type TurnStartEvent,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
-import { interceptSections } from "./extensions/mutation-interceptor-hooks.ts";
+// biome-ignore format: minimize fork diff
+import { beginMutationTurn, type MutationActiveToolsContext, rethrowTrustedMutationInterceptorError } from "./extensions/mutation-interceptor.ts";
+// biome-ignore format: minimize fork diff
+import { interceptSections, observeResourcesApplied, observeResourcesDiscoverSkipped } from "./extensions/mutation-interceptor-hooks.ts";
+// biome-ignore format: minimize fork diff
+import { applyLoadoutDescriptions, beginActiveToolsMutation, beginPrepareLoadoutMutation, beginToolRegistryMutation, interceptTurnContext, setMutationSessionIdentity } from "./extensions/mutation-interceptor-session.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
@@ -143,7 +148,6 @@ import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
 	buildSystemPrompt,
-	buildSystemPromptSections,
 	diffSystemPromptSections,
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
@@ -968,6 +972,7 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
+			beginMutationTurn(this._resourceLoader.getExtensions().runtime);
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
 			const nextContext = previousSnapshot?.context ?? context;
@@ -1606,22 +1611,33 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
-		const previous = this.getActiveToolNames();
-		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool of the restored one replaces it, and its pending tools are
-		// dropped. One that only adds tools, like activating tool_search, keeps them, and so does one
-		// that only deactivates tools outside the restored loadout, such as an extension's own tool that
-		// the restore or reload activated as newly registered.
-		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name) && this._restoredToolNames.has(name))) {
-			this._pendingToolNames.clear();
-		}
+		this._setActiveTools(toolNames, "host_api", null, true);
 	}
 
-	private _setActiveTools(toolNames: string[]): void {
-		const tools = this._applyToolLoadout(toolNames);
+	// biome-ignore format: minimize fork diff
+	private _projectActiveToolsContext(requestedTools: readonly string[], activeTools: readonly string[]): MutationActiveToolsContext {
+		const hiddenTools = [...this._hiddenDeclarations];
+		return {
+			requestedTools: [...requestedTools],
+			activeTools: [...activeTools],
+			callableTools: this._getCallableTools(new Set(activeTools)).map((tool) => tool.name),
+			hiddenTools,
+			modelDeclaredTools: activeTools.filter((name) => !this._hiddenDeclarations.has(name)),
+		};
+	}
+
+	// biome-ignore format: minimize fork diff
+	private _setActiveTools(toolNames: string[], reason: string, sourceInfo: SourceInfo | null = null, clearPendingOnDeactivate = false): void {
+		const beforeNames = this.getActiveToolNames();
+		// biome-ignore format: minimize fork diff
+		const mutation = beginActiveToolsMutation(this._resourceLoader, this._projectActiveToolsContext(beforeNames, beforeNames), this._projectActiveToolsContext(toolNames, toolNames), reason, sourceInfo);
+		const tools = this._applyToolLoadout(mutation.accepted, mutation.callId);
+		const appliedNames = tools.map((tool) => tool.name);
+		mutation.applied(this._projectActiveToolsContext(toolNames, appliedNames));
 		for (const tool of tools) this._pendingToolNames.delete(tool.name);
-		this._rebuildSystemPrompt(tools.map((tool) => tool.name));
+		// biome-ignore format: minimize fork diff
+		if (clearPendingOnDeactivate && beforeNames.some((name) => !appliedNames.includes(name) && this._restoredToolNames.has(name))) this._pendingToolNames.clear();
+		this._rebuildSystemPrompt(appliedNames);
 	}
 
 	/**
@@ -1669,7 +1685,7 @@ export class AgentSession {
 	 * The active tools are a set: tools that stay active keep their current order and newly active
 	 * ones are appended, so reordering the same names does not change the prompt (#11495).
 	 */
-	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
+	private _applyToolLoadout(toolNames: string[], parentCallId: string | null = null): AgentTool[] {
 		const requested = new Set(toolNames);
 		const kept = this.getActiveToolNames().filter((name) => requested.has(name));
 		const tools = [...new Set([...kept, ...requested])].flatMap((name) => {
@@ -1693,13 +1709,15 @@ export class AgentSession {
 			};
 			const descriptions = new Map<string, string>();
 			for (const { definition, sourceInfo } of hooks) {
+				// biome-ignore format: minimize fork diff
+				const mutation = beginPrepareLoadoutMutation(this._resourceLoader, definition, sourceInfo, loadout, parentCallId);
+				let proposed: ReturnType<NonNullable<ToolDefinition["prepareLoadout"]>>;
+				let callbackError: unknown;
 				try {
-					const changes = definition.prepareLoadout?.(loadout);
-					for (const [name, description] of Object.entries(changes?.descriptions ?? {})) {
-						descriptions.set(name, description);
-					}
-					for (const name of changes?.hiddenDeclarations ?? []) hidden.add(name);
+					proposed = definition.prepareLoadout?.(loadout);
 				} catch (error) {
+					rethrowTrustedMutationInterceptorError(error);
+					callbackError = error;
 					this._extensionRunner.emitError({
 						extensionPath: sourceInfo.path,
 						event: "prepare_loadout",
@@ -1707,11 +1725,15 @@ export class AgentSession {
 						stack: error instanceof Error ? error.stack : undefined,
 					});
 				}
+				const changes = mutation.candidate(proposed, callbackError);
+				for (const [name, description] of Object.entries(changes?.descriptions ?? {})) {
+					descriptions.set(name, description);
+				}
+				for (const name of changes?.hiddenDeclarations ?? []) hidden.add(name);
+				const merged = applyLoadoutDescriptions(tools, descriptions);
+				mutation.applied(changes, descriptions, hidden, merged, callbackError);
 			}
-			declared = tools.map((tool) => {
-				const description = descriptions.get(tool.name);
-				return description === undefined ? tool : { ...tool, description };
-			});
+			declared = applyLoadoutDescriptions(tools, descriptions);
 		}
 		this._hiddenDeclarations = hidden;
 		this.agent.state.tools = declared;
@@ -1838,12 +1860,26 @@ export class AgentSession {
 		options: NormalizedBuildSystemPromptOptions,
 		messages: AgentMessage[] = this.agent.state.messages,
 	): SystemMessage | undefined {
-		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
+		const extensionRuntime = this._resourceLoader.getExtensions().runtime;
+		const contribution = extensionRuntime.mutationActiveContribution;
+		extensionRuntime.mutationActiveContribution = undefined;
+		// biome-ignore format: minimize fork diff
+		const activeMutation = contribution ? beginActiveToolsMutation(this._resourceLoader, this._projectActiveToolsContext(this.getActiveToolNames(), this.getActiveToolNames()), this._projectActiveToolsContext(options.selectedTools, options.selectedTools), "handler_selection", contribution.sourceInfo, contribution.callId) : undefined;
+		// biome-ignore format: minimize fork diff
+		let tools = this._applyToolLoadout(activeMutation?.accepted ?? options.selectedTools, activeMutation?.callId ?? null);
+		const appliedToolNames = tools.map((tool) => tool.name);
+		activeMutation?.applied(this._projectActiveToolsContext(options.selectedTools, appliedToolNames));
+		options.selectedTools = appliedToolNames;
 		// The tool list and rules must match the declarations the request carries.
 		options.hiddenTools = [...this._hiddenDeclarations];
+		// biome-ignore format: minimize fork diff
+		const intercepted = interceptTurnContext(this._resourceLoader, options, tools, [...this._toolDefinitions.values()], this._getCallableTools().map((tool) => tool.name), tools.filter((tool) => !this._hiddenDeclarations.has(tool.name)).map((tool) => tool.name), (selectedTools) => this._getCallableTools(new Set(selectedTools)).map((tool) => tool.name));
+		tools = intercepted.tools;
+		this._hiddenDeclarations = new Set(intercepted.hiddenTools);
+		this.agent.state.tools = tools;
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
-			interceptSections(this._resourceLoader, messages, buildSystemPromptSections(options)),
+			interceptSections(this._resourceLoader, messages, intercepted.sections),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
 	}
@@ -1943,7 +1979,7 @@ export class AgentSession {
 			),
 		);
 		// Ignores names that are not registered.
-		this._setActiveTools(names);
+		this._setActiveTools(names, "transcript_restore");
 	}
 
 	// =========================================================================
@@ -2018,6 +2054,7 @@ export class AgentSession {
 		}
 
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		beginMutationTurn(this._resourceLoader.getExtensions().runtime);
 		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
 		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 		// which updates the live loadout instead. An explicit edit wins; otherwise the live
@@ -3455,6 +3492,7 @@ export class AgentSession {
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
 		if (!this._extensionRunner.hasHandlers("resources_discover")) {
+			observeResourcesDiscoverSkipped(this._resourceLoader.getExtensions().runtime, reason);
 			return;
 		}
 
@@ -3464,6 +3502,8 @@ export class AgentSession {
 		);
 
 		if (skillPaths.length === 0 && promptPaths.length === 0 && themePaths.length === 0) {
+			// biome-ignore format: minimize fork diff
+			observeResourcesApplied(this._resourceLoader.getExtensions().runtime, { skillPaths: skillPaths.map((entry) => entry.path), promptPaths: promptPaths.map((entry) => entry.path), themePaths: themePaths.map((entry) => entry.path) }, "empty");
 			return;
 		}
 
@@ -3474,6 +3514,8 @@ export class AgentSession {
 		};
 
 		this._resourceLoader.extendResources(extensionPaths);
+		// biome-ignore format: minimize fork diff
+		observeResourcesApplied(this._resourceLoader.getExtensions().runtime, { skillPaths: skillPaths.map((entry) => entry.path), promptPaths: promptPaths.map((entry) => entry.path), themePaths: themePaths.map((entry) => entry.path) }, "applied");
 		this._rebuildSystemPrompt(this.getActiveToolNames());
 	}
 
@@ -3594,8 +3636,9 @@ export class AgentSession {
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
 				getSettings: () => this.settingsManager.getSettings(),
-				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
-				refreshTools: () => this._refreshToolRegistry(),
+				setActiveTools: (toolNames, sourceInfo) =>
+					this._setActiveTools(toolNames, "extension_api", sourceInfo, true),
+				refreshTools: (sourceInfo) => this._refreshToolRegistry({ reason: "registry_refresh", sourceInfo }),
 				getCommands,
 				setModel: async (model) => {
 					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
@@ -3664,7 +3707,8 @@ export class AgentSession {
 		);
 	}
 
-	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
+	// biome-ignore format: minimize fork diff
+	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean; reason?: string; sourceInfo?: SourceInfo }): void {
 		// Tools that were already activated on registration. A tool whose exposure changes to
 		// `direct` or `model-only` (for example from `hidden`) is activated like a new tool.
 		const previousActivatedOnRegistration = new Set(
@@ -3681,7 +3725,7 @@ export class AgentSession {
 				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
 			})),
 		].filter((tool) => this._isAllowedTool(tool.definition.name));
-		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
+		let definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
 				.filter(([name]) => this._isAllowedTool(name))
 				.map(([name, definition]) => [
@@ -3698,6 +3742,8 @@ export class AgentSession {
 				sourceInfo: tool.sourceInfo,
 			});
 		}
+		const registryMutation = beginToolRegistryMutation(this._resourceLoader, definitionRegistry);
+		definitionRegistry = registryMutation.accepted;
 		this._toolDefinitions = definitionRegistry;
 		this._toolPromptSnippets = new Map(
 			Array.from(definitionRegistry.values())
@@ -3716,24 +3762,12 @@ export class AgentSession {
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
 		);
 		const runner = this._extensionRunner;
-		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
-		const wrappedBuiltInTools = wrapRegisteredTools(
-			Array.from(this._baseToolDefinitions.values())
-				.filter((definition) => this._isAllowedTool(definition.name))
-				.map((definition) => ({
-					definition,
-					sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${definition.name}`, {
-						source: "builtin",
-					}),
-				})),
-			runner,
-		);
-
-		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
-		for (const tool of wrappedExtensionTools as AgentTool[]) {
-			toolRegistry.set(tool.name, tool);
-		}
-		this._toolRegistry = toolRegistry;
+		const wrappedTools = wrapRegisteredTools([...definitionRegistry.values()], runner);
+		// biome-ignore format: minimize fork diff
+		const extensionToolNames = new Set([...definitionRegistry.entries()].filter(([, entry]) => entry.sourceInfo.source !== "builtin").map(([name]) => name));
+		const wrappedExtensionTools = wrappedTools.filter((tool) => extensionToolNames.has(tool.name));
+		this._toolRegistry = new Map(wrappedTools.map((tool) => [tool.name, tool]));
+		registryMutation.applied(definitionRegistry);
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
@@ -3761,7 +3795,8 @@ export class AgentSession {
 		// Pending tools that are registered now become active.
 		nextActiveToolNames.push(...this._pendingToolNames);
 
-		this._setActiveTools([...new Set(nextActiveToolNames)]);
+		// biome-ignore format: minimize fork diff
+		this._setActiveTools([...new Set(nextActiveToolNames)], options?.reason ?? "registry_refresh", options?.sourceInfo ?? null);
 	}
 
 	/** Whether activating the tool declares it to the model. */
@@ -3779,6 +3814,7 @@ export class AgentSession {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
 		includeAllExtensionTools?: boolean;
+		activeReason?: string;
 	}): void {
 		const autoResizeImages = this.settingsManager.getImageAutoResize();
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
@@ -3800,6 +3836,7 @@ export class AgentSession {
 		);
 
 		const extensionsResult = this._resourceLoader.getExtensions();
+		setMutationSessionIdentity(this._resourceLoader, this.sessionId);
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
 				extensionsResult.runtime.flagValues.set(name, value);
@@ -3826,6 +3863,7 @@ export class AgentSession {
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
+			reason: options.activeReason ?? "initial_default",
 		});
 	}
 
@@ -3863,6 +3901,7 @@ export class AgentSession {
 			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
+			activeReason: "resource_reload",
 		});
 
 		if (this._extensionsBound) {

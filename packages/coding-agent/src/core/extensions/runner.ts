@@ -9,6 +9,7 @@ import {
 	type Model,
 	type Provider,
 	type ProviderHeaders,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
@@ -25,7 +26,9 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
-import { beginMutation, contextMutation } from "./mutation-interceptor-hooks.ts";
+import { rethrowTrustedMutationInterceptorError } from "./mutation-interceptor.ts";
+// biome-ignore format: minimize fork diff
+import { beginMutation, beginResourcesDiscoverMutation, contextMutation, interceptFinalProviderPayload, interceptNormalizedFinal, observeHandlerSetSkipped, observeProviderTransformSkipped } from "./mutation-interceptor-hooks.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartCustomEvent,
@@ -317,6 +320,7 @@ export async function emitProjectTrustEvent(
 				}
 				return { result: handlerResult, errors };
 			} catch (error) {
+				rethrowTrustedMutationInterceptorError(error);
 				errors.push({
 					extensionPath: ext.path,
 					event: event.type,
@@ -1068,6 +1072,7 @@ export class ExtensionRunner {
 					if (handlerResult?.entries !== undefined) entries = handlerResult.entries;
 					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1080,6 +1085,7 @@ export class ExtensionRunner {
 					context = await buildContext(entries);
 					valid = true;
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					valid = false;
 					this.emitError({
 						extensionPath: ext.path,
@@ -1121,6 +1127,7 @@ export class ExtensionRunner {
 						}
 					}
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1147,6 +1154,7 @@ export class ExtensionRunner {
 					const result = (await handler(event, ctx)) as CacheWarmingDecisionEventResult | undefined;
 					if (result?.action !== undefined) action = result.action;
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					this.emitError({
 						extensionPath: ext.path,
 						event: event.type,
@@ -1184,6 +1192,7 @@ export class ExtensionRunner {
 					currentMessage = handlerResult.message;
 					modified = true;
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1233,6 +1242,7 @@ export class ExtensionRunner {
 						modified = true;
 					}
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1293,6 +1303,7 @@ export class ExtensionRunner {
 					}
 					return handlerResult;
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1317,6 +1328,8 @@ export class ExtensionRunner {
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
+		if (!this.hasHandlers("context")) observeHandlerSetSkipped(this.runtime, "context");
+		if (!this.hasHandlers("context_with_system")) observeHandlerSetSkipped(this.runtime, "context_with_system");
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context")) {
 			for (const handler of handlers) {
@@ -1335,6 +1348,8 @@ export class ExtensionRunner {
 					currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
 					mutation?.capture(visibleSnapshot, returned);
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
+					mutation?.fail(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1365,8 +1380,9 @@ export class ExtensionRunner {
 							error: "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage().",
 						});
 					}
-					mutation?.succeed();
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
+					mutation?.fail(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1383,9 +1399,14 @@ export class ExtensionRunner {
 		return currentMessages;
 	}
 
+	emitNormalizedFinal(context: TranscriptContext): TranscriptContext {
+		return interceptNormalizedFinal(this.runtime, context);
+	}
+
 	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
 		const ctx = this.createContext();
 		let currentPayload = payload;
+		if (!this.hasHandlers("before_provider_request")) observeProviderTransformSkipped(this.runtime);
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_provider_request")) {
 			for (const handler of handlers) {
@@ -1399,8 +1420,9 @@ export class ExtensionRunner {
 					if (handlerResult !== undefined) {
 						currentPayload = handlerResult;
 					}
-					mutation?.succeed();
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
+					mutation?.fail(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1414,7 +1436,7 @@ export class ExtensionRunner {
 			}
 		}
 
-		return currentPayload;
+		return interceptFinalProviderPayload(this.runtime, currentPayload);
 	}
 
 	async emitBeforeProviderHeaders(headers: ProviderHeaders): Promise<ProviderHeaders> {
@@ -1430,6 +1452,7 @@ export class ExtensionRunner {
 					};
 					await handler(event, ctx);
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1460,6 +1483,8 @@ export class ExtensionRunner {
 			return renderCurrentSystemPrompt();
 		};
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		this.runtime.mutationActiveContribution = undefined;
+		if (!this.hasHandlers("before_agent_start")) observeHandlerSetSkipped(this.runtime, "before_agent_start");
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
 			for (const handler of handlers) {
@@ -1482,8 +1507,9 @@ export class ExtensionRunner {
 							currentOptions.forceSystemPrompt = result.systemPrompt;
 						}
 					}
-					mutation?.succeed();
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
+					mutation?.fail(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1508,6 +1534,8 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
+		this.runtime.mutationResourceContributions = new Map();
+		if (!this.hasHandlers("resources_discover")) observeHandlerSetSkipped(this.runtime, "resources_discover");
 		const ctx = this.createContext();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
@@ -1515,21 +1543,15 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "resources_discover")) {
 			for (const handler of handlers) {
+				const mutation = beginResourcesDiscoverMutation(this.runtime, ext, reason);
+				let result: ResourcesDiscoverResult | undefined;
+				let error: unknown;
 				try {
 					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-					const handlerResult = await handler(event, ctx);
-					const result = handlerResult as ResourcesDiscoverResult | undefined;
-
-					if (result?.skillPaths?.length) {
-						skillPaths.push(...result.skillPaths.map((path) => ({ path, extensionPath: ext.path })));
-					}
-					if (result?.promptPaths?.length) {
-						promptPaths.push(...result.promptPaths.map((path) => ({ path, extensionPath: ext.path })));
-					}
-					if (result?.themePaths?.length) {
-						themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path })));
-					}
+					result = (await handler(event, ctx)) as ResourcesDiscoverResult | undefined;
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
+					error = err;
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1539,6 +1561,11 @@ export class ExtensionRunner {
 						stack,
 					});
 				}
+				// biome-ignore format: minimize fork diff
+				const accepted = mutation.finish({ skillPaths: result?.skillPaths ?? [], promptPaths: result?.promptPaths ?? [], themePaths: result?.themePaths ?? [] }, error);
+				skillPaths.push(...accepted.skillPaths.map((path) => ({ path, extensionPath: ext.path })));
+				promptPaths.push(...accepted.promptPaths.map((path) => ({ path, extensionPath: ext.path })));
+				themePaths.push(...accepted.themePaths.map((path) => ({ path, extensionPath: ext.path })));
 			}
 		}
 
@@ -1573,6 +1600,7 @@ export class ExtensionRunner {
 						currentImages = result.images ?? currentImages;
 					}
 				} catch (err) {
+					rethrowTrustedMutationInterceptorError(err);
 					this.emitError({
 						extensionPath: ext.path,
 						event: "input",
